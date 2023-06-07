@@ -1,0 +1,871 @@
+---
+title: "Stat 527 Project"
+author: "Anqi Zhao"
+date: "2023-05-03"
+output: pdf_document
+---
+
+```{r}
+# Import the data
+setwd("/Users/keon/Desktop/Stat 527A/project")
+library(readr)
+library(uwot)
+library(dbscan)
+library(ggplot2)
+library(plotly)
+library(Rtsne)
+library(class)
+library(meanShiftR)
+project_data <- read_csv("project-data.csv", col_names = FALSE)
+data <- as.matrix(project_data)
+```
+
+Since we have 64 features to consider, we may view this data as in $$R^64$$, and we can assign every point in a cluster with other points who are "close" to this point. 
+
+However, working with 64-D data is not optimal: e.g. it's hard to create a grid in 64-D as what we did in assignment 2 for mean-shift in 1-D. 
+
+```{r eval=FALSE}
+# Suppose data is your data frame with 64 columns of features
+
+# Perform PCA
+pca_result <- prcomp(data, scale. = TRUE)
+
+# Extract the proportion of variance explained by each principal component
+explained_variance <- pca_result$sdev^2
+total_variance <- sum(explained_variance)
+explained_variance_ratio <- explained_variance / total_variance
+
+# Plot explained variance ratio
+plot(explained_variance_ratio, xlab = "Principal Component", 
+     ylab = "Proportion of Variance Explained", 
+     type = "b")
+
+# Cumulative variance plot
+cumulative_explained_variance <- cumsum(explained_variance_ratio)
+plot(cumulative_explained_variance, xlab = "Principal Component", 
+     ylab = "Cumulative Proportion of Variance Explained", 
+     type = "b")
+
+```
+
+As one can see here, the plots are not so ideal, since they are both approximately linear.
+
+Ideally: 
+
+In the first plot, each point represents the proportion of the total variance explained by each principal component. Typically, you'll see that the first few components explain a large proportion of the variance, and each subsequent component explains less and less.
+
+The second plot shows the cumulative proportion of total variance explained. This can help you identify how many components you need to keep to explain a certain proportion (e.g., 95%) of the total variance.
+
+To deal with this, here are something that we can do:
+
+1. Interpretation: Recognize that your data may not have a strong structure that can be easily summarized by a few key features. This might indicate that all features in your dataset are equally important, and no subset of features can represent a majority of the information.
+
+2. Investigate Further: Check the distributions of your features, correlations between them, and consider domain-specific knowledge. The equal importance of all features as indicated by the PCA might suggest that your features are uncorrelated and equally variable, but further investigation might reveal additional structure or potential issues with the data.
+
+3. PCA Reconsideration: Since PCA is linear and assumes that your data is Gaussian, it's possible that these assumptions are not well-suited to your dataset. In such case, you might want to try a non-linear dimensionality reduction technique like t-SNE or UMAP. These methods do not rely on variance explained, and can sometimes discover structure that PCA misses.
+
+```{r eval=FALSE}
+# Check for Gaussian distributed assumption
+p_value <- NULL
+for (i in 1:ncol(data)) {
+  p_value[i] <- shapiro.test(sample(data[,i],5000))$p.value
+}
+p_value
+```
+
+As one can see, from the p-values above, most of the features are not Normally distributed, so we notice that it may not be completely suitable to use the PCA. 
+
+```{r eval=FALSE}
+# Print summary of the PCA results
+# summary(pca_results)
+# Extract the scores for the first principal component
+scores <- pca_result$x[,1:2]
+# Now 'scores' contains the coordinates of your data in the first principal component
+summary(scores)
+# These scores are a one-dimensional representation of your data.
+plot(scores[,1],scores[,2],cex=0.1)
+```
+
+We should also try other dimension reduction strategies, to avoid being "trapped" by PCA, since we already expect the result may not be trustful since the assumptions may not be achieved. Let's try a non-linear one: t-SNE
+
+```{r eval=FALSE}
+set.seed(123)
+
+# Let's say your data is stored in a data frame named 'data'
+
+# Run t-SNE for 1 dimension
+tsne_results_1D <- Rtsne(data, dims = 1)
+# The one-dimensional embedding is stored in 'Y'
+embedding_1D <- tsne_results_1D$Y
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D <- Rtsne(data, dims = 2)
+
+# The two-dimensional embedding is stored in 'Y'
+embedding_2D <- tsne_results_2D$Y # This is going to be the data we used for clustering. 
+summary(embedding_2D)
+plot(embedding_2D[,1],embedding_2D[,2],cex=0.1)
+```
+
+We can also try combining PCA method and t-SNE method.
+
+The resulting clusters (visualized) is not as clear as what t-SNE do. 
+
+```{r eval=FALSE}
+data_10 <- pca_result$x[,1:10]
+data_2 <- Rtsne(data_10, dims = 2)
+data_2D <- data_2$Y
+plot(data_2D[,1],data_2D[,2],cex=0.1)
+```
+
+In 2D:
+
+Since our first method is mean-shift, let's do the cross-validation to select optimal 
+
+```{r eval=FALSE}
+set.seed(123)
+v <- sample(1:12000, 1200, replace = FALSE)
+dv <- embedding_2D[v,]
+d <- embedding_2D[-v,]
+
+# Define the Gaussian kernel density estimator for 2 dimensions
+kernel_density_2d <- function(x, d, h) {
+  diff <- sweep(d, 2, x, "-")
+  K <- dnorm(sqrt(rowSums(diff^2))/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h^2))
+}
+
+# Define the range of kernel widths to test
+# The upper bound is 2 since we also tested for 
+# h_range <- seq(2, 10, by = 1) and h_range <- seq(10, 50, by = 2)
+# the h_best are always reported as the lower bound
+h_range <- seq(0.1, 2, by = 0.1)
+
+# Compute log-likelihood of validation set for each kernel width
+lv <- rep(0, length(h_range))
+for (i in 1:length(h_range)) {
+  h <- h_range[i]
+  ph <- sapply(1:nrow(dv), function(x) kernel_density_2d(dv[x,], d, h))
+  lv[i] <- sum(log(ph))
+}
+
+# Compute likelihood of training set for each kernel width
+# l <- rep(0, length(h_range))
+# for (i in 1:length(h_range)) {
+#   h <- h_range[i]
+#   ph <- sapply(1:nrow(d), function(x) kernel_density_2d(d[x,], d, h))
+#   l[i] <- sum(log(ph))
+# }
+
+# Find the bandwidth that maximizes the likelihood on the validation set
+h_best <- h_range[which.max(lv)]
+
+# Create a grid of points at which to evaluate the density
+grid <- expand.grid(V1 = seq(min(d[,1]), max(d[,1]), length.out = 100),
+                    V2 = seq(min(d[,2]), max(d[,2]), length.out = 100))
+
+# Evaluate the kernel density estimate at the points on the grid
+z <- matrix(sapply(1:nrow(grid), function(x) kernel_density_2d(as.numeric(grid[x,]), d, h_best)),
+            nrow = 100, ncol = 100)
+
+# Sort the grid's V1 and V2
+grid_sorted <- grid[order(grid$V1, grid$V2),]
+
+# Create the contour plot with the sorted grid
+filled.contour(sort(unique(grid_sorted$V1)), 
+               sort(unique(grid_sorted$V2)), 
+               z, color.palette = terrain.colors, 
+               xlab = "V1", ylab = "V2", 
+               main = "Estimated density")
+
+z_1 <- matrix(sapply(1:nrow(grid), function(x) kernel_density_2d(as.numeric(grid[x,]), d,2.5)),nrow = 100, ncol = 100)
+
+filled.contour(sort(unique(grid_sorted$V1)), 
+               sort(unique(grid_sorted$V2)), 
+               z_1, color.palette = terrain.colors, 
+               xlab = "V1", ylab = "V2", 
+               main = "Estimated density")
+```
+
+However, as the contour maps shown above, the cross-validation seems don't give the best result as we expect to see. We also tried bandwidth h=3, although we don't know if this is the best band-width (since we only have a feeling that this looks fine, but we can't tell if this is too smooth or too rough), it seems better than the CV result that is too sensitive to each data point and noise.
+
+We may evaluate our cross-validation, check if we made anything wrong with it:
+
+1. I define a range of bandwidths (h_range) to test.
+2. I then calculate the log-likelihood of the validation set (lv) for each kernel width. This is done by applying the kernel_density_2d function to each data point in dv and then taking the sum of the natural logarithm of these values.
+3. I find the bandwidth that maximizes the likelihood on the validation set (h_best).
+
+In 1-D:
+
+Let's do the cross-validation:
+
+```{r eval=FALSE}
+set.seed(123)
+
+# Define the Gaussian kernel density estimator
+kernel_density <- function(x, d, h) {
+  K <- dnorm((x-d)/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h))
+}
+
+# Define the range of kernel widths to test
+h_range_1 <- seq(2.5, 5, by = 0.5)
+
+dv_1 <- sample(embedding_1D,1200)
+
+d_1 <- setdiff(embedding_1D,dv_1)
+
+# Compute log-likelihood of validation set for each kernel width
+lv_1 <- rep(0, length(h_range_1))
+for (i in 1:length(h_range_1)) {
+  h <- h_range_1[i]
+  ph <- sapply(dv_1, function(x) kernel_density(x, d_1, h))
+  lv_1[i] <- sum(log(ph))
+}
+
+h <- h_range_1[which.max(lv_1)]
+
+x <- seq(-60, 60, length.out = 1000)
+
+plot1 <- sapply(x, function(x) kernel_density(x, embedding_1D, h))
+plot(x,plot1,type = "l", ylab = "density", main = "Kernel Density Estimation with h=2.5")
+
+par(mfrow = c(2, 2))
+
+plot2 <- sapply(x, function(x) kernel_density(x, embedding_1D, 0.5))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=0.5")
+
+plot2 <- sapply(x, function(x) kernel_density(x, embedding_1D, 1))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=1")
+
+plot2 <- sapply(x, function(x) kernel_density(x, embedding_1D, 2))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=2")
+
+plot2 <- sapply(x, function(x) kernel_density(x, embedding_1D, 3))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=3")
+
+```
+
+If we only counts the peaks, we can see there are roughly 8 of them, this number is very close to what we can see from 2-D contour map, so by this, our number of clusters seems reasonable.  
+
+Clustering in 1-D:
+
+Mean-Shift function:
+
+```{r eval=FALSE}
+# Define the kernel function
+K <- function(u) {
+  return(1/(sqrt(2*pi))*exp(-0.5*u^2))
+}
+
+mean_shift <- function(D, h, xi) {
+  tol <- 1e-3*h
+  T <- 10000
+  for (t in 1:T) {
+    # Compute the mean shift vector
+    m <- sum(K((D - xi)/h)*D)/sum(K((D - xi)/h))
+    # Check for convergence
+    if (max(abs(m - xi)) < tol) {
+      return(m)
+    }
+    # Update x
+    xi <- m
+  }
+  # If convergence is not achieved after T iterations, return NULL
+  return(NULL)
+  # else if convergence is not achieved after T iterations, return the last xi value
+  #return(xi)
+}
+
+# Test with point at t
+
+t <- 28
+prime <- mean_shift(embedding_1D,h,t)
+plot(x,plot1,type = "l", ylab = "density", main = "Mean Clustering on KDE")
+plot_prime <- sapply(prime, function(x) kernel_density(x, embedding_1D, h))
+plot <- sapply(t, function(x) kernel_density(x, embedding_1D, h))
+points(prime,plot_prime,col = "red")
+points(t,plot,col = "blue")
+legend("topright", c("x'","x"), pch = 20, col = c("red", "blue"))
+
+```
+
+Next chunk is disgarded:: 
+
+```{r eval=FALSE}
+# x_prime <- sapply(embedding_1D, function(x) mean_shift(embedding_1D, h, x))
+# # KDE
+# plot(x,plot1,type = "l", ylab = "density", main = "Mean Clustering on KDE")
+# plot_prime <- sapply(x_prime, function(x) kernel_density(x, embedding_1D, h))
+# points(x_prime,plot_prime)
+```
+
+Apply this to a subset of points:
+
+```{r eval=FALSE}
+# Subset your data
+set.seed(123)  # for reproducibility
+idx <- sample(1:12000, 100, replace = FALSE)  # indices of the points you applied mean shift to
+mean_shift_data <- embedding_1D[idx]  # the points you applied mean shift to
+remaining_data <- embedding_1D[-idx]  # the points that remain
+x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(embedding_1D, h, x))
+# KDE
+plot(x,plot1,type = "l", ylab = "density", main = "Mean Clustering on KDE")
+plot_prime <- sapply(x_prime_sub, function(x) kernel_density(x, embedding_1D, h))
+points(x_prime_sub,plot_prime)
+```
+
+Clustering result:
+
+Choose a tolerance $\delta=2$, use the Nearest Neighbor Method to find the clusters. 
+
+```{r eval=FALSE}
+# Define function to find clusters
+find_clusters <- function(points, delta) {
+  # Sort the points in ascending order
+  points <- sort(points)
+  
+  # Initialize vector of cluster assignments
+  cluster_assignments <- rep(0, length(points))
+  
+  # Initialize cluster counter
+  cluster_count <- 1
+  
+  # Initialize first cluster
+  curr_cluster <- 1
+  
+  # Loop over remaining points
+  for (i in 1:length(points)) {
+    if (points[i] - points[curr_cluster] <= delta) {
+      # Add point to current cluster
+      cluster_assignments[i] <- cluster_count
+    } else {
+      # Start new cluster
+      curr_cluster <- i
+      cluster_count <- cluster_count + 1
+      cluster_assignments[i] <- cluster_count
+    }
+  }
+  
+  return(cluster_assignments)
+}
+
+delta <- 2
+
+clusters <- find_clusters(x_prime_sub, delta)-1
+
+clusters_unsorted <- NULL
+
+for (i in 1:length(x_prime_sub)) {
+  clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+}
+
+# Create scatter plot of data with cluster assignments
+plot(sort(mean_shift_data), clusters, pch=20, col="red", xlab = "x", ylab = "Cluster Assignment", xlim = c(-60,60))
+
+```
+
+Then assign the rest of the points to clusters using k-NN method.
+
+```{r eval=FALSE}
+# You might need to install the "class" package
+# install.packages("class")
+
+
+# Prepare cluster assignments
+table(clusters_unsorted)
+# Use k-NN to assign remaining points to clusters
+remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                          test = matrix(remaining_data, ncol = 1), 
+                          cl = clusters_unsorted, 
+                          k = 3)
+
+# Combine cluster assignments
+all_clusters <- matrix(c(1:12000,rep(NA,12000)), nrow = 12000, ncol = 2)
+
+all_clusters[idx,2] <- clusters_unsorted
+all_clusters[-idx,2] <- as.numeric(remaining_clusters)-1
+
+```
+
+Make a plot in 1-D to show this: 
+
+```{r eval=FALSE}
+plot(x,plot1,type="l",ylim = c(0,0.012))
+points(embedding_1D, (all_clusters[,2]/1000), cex=0.1, add = TRUE)
+# find the boundaries for each cluster
+table(all_clusters[,2])
+group <- cbind(embedding_1D,all_clusters[,2])
+
+ranges <- list()
+for (i in 1:8) {
+  # filter the data for the current group
+  current_group_data <- group[group[,2] == i-1,]
+  
+  # check if there are any rows in the current_group_data
+  if(nrow(current_group_data) > 0){
+    ranges[[i]] <- range(current_group_data[,1])
+  } else {
+    ranges[[i]] <- c(NA, NA)  # assign NA if there are no observations in the current group
+  }
+}
+
+print(ranges)
+for (i in c(1,3,5,7)) {
+  abline(v = c(ranges[[i]][1], ranges[[i]][2]), col = "red", lty = 2, lwd = 0.5)
+}
+for (i in c(2,4,6,8)) {
+  abline(v = c(ranges[[i]][1], ranges[[i]][2]), col = "blue", lty = 2, lwd = 0.5)
+}
+```
+
+```{r eval=FALSE}
+# Assuming data is your dataframe and it has columns x, y, and cluster
+plot(embedding_2D[,1], embedding_2D[,2], col = all_clusters[,2]+1, cex=0.1)
+```
+
+Try the package: 
+
+```{r eval=FALSE}
+# The result is not better using the package
+result_mean <- meanShift(as.matrix(embedding_1D), nNeighbors = 3, algorithm = "KDTREE", bandwidth = 3, iterations = 100, epsilonCluster = 0.5)
+# epsilonCluster is the minimal distance between clusters
+# bandwidth is the bandwidth
+# nNeighbors is the number of neighbors in k-NN
+# algorithm: A string indicating the algorithm to use for nearest neighbor searches. Currently, only "LINEAR" and "KDTREE" methods are supported.
+table(result_mean$assignment)
+data_pack <- cbind(embedding_2D,result_mean$assignment)
+# Assuming data is your dataframe and it has columns x, y, and cluster
+plot(data_pack[,1], data_pack[,2], col = data_pack[,3], cex=0.1)
+```
+
+Check the plot, we find out that the mean-shift clustering result doesn't look so good. Is this because t-SNE processed data are too close to each other? 
+
+t-SNE (t-Distributed Stochastic Neighbor Embedding) and UMAP (Uniform Manifold Approximation and Projection) are both popular dimensionality reduction methods frequently used for visualization of high-dimensional data. Each has its strengths and weaknesses, and the choice between the two often depends on the specific characteristics of your data and what you want to achieve. Here are some factors to consider:
+
+1. Preservation of Global Structure: UMAP is designed to preserve the global structure of data, which means it can maintain the broad relationships between clusters or groups in the data. On the other hand, t-SNE is best at preserving local structure, meaning it excellently maintains the relationships between nearby points while sacrificing some understanding of the broader relationships in the data.
+
+2. Runtime and scalability: UMAP tends to run faster than t-SNE, and it scales better to larger datasets. So, if you have a large dataset, UMAP might be a more practical choice.
+
+3. Stability: t-SNE's results can vary between runs due to the randomness in the algorithm. This can be mitigated by setting a seed for the random number generator, but UMAP is generally more stable and less dependent on random initialization.
+
+4. Interpretability: UMAP's distances can be more interpretable since it tries to preserve aspects of the global structure, making it somewhat more faithful to the original high-dimensional distances.
+
+5. Flexibility: UMAP is more flexible in terms of its applicability to a variety of datasets. It can be used for tasks beyond visualization, like semi-supervised learning, whereas t-SNE is primarily used for visualization.
+
+In summary, if you are interested in local structure and don't mind a bit more runtime, then t-SNE might be the tool for you. If you're working with a larger dataset, care about global structure, or need a faster/more stable result, then UMAP would be a better choice. Ultimately, you might want to try both methods and see which provides more useful results for your specific application.
+
+```{r}
+set.seed(123)
+
+proj_1d <- umap(data, n_neighbors=30, n_components=1)
+proj_2d <- umap(data, n_neighbors=30, n_components=2)
+plot(proj_2d[,1],proj_2d[,2],cex=0.1)
+
+v <- sample(1:12000, 1200, replace = FALSE)
+dv <- proj_2d[v,]
+d <- proj_2d[-v,]
+
+# Define the Gaussian kernel density estimator for 2 dimensions
+kernel_density_2d <- function(x, d, h) {
+  diff <- sweep(d, 2, x, "-")
+  K <- dnorm(sqrt(rowSums(diff^2))/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h^2))
+}
+
+# Define the range of kernel widths to test
+# The upper bound is 2 since we also tested for 
+# h_range <- seq(2, 10, by = 1) and h_range <- seq(10, 50, by = 2)
+# the h_best are always reported as the lower bound
+h_range <- seq(0.01, 0.1, by = 0.01)
+
+# Compute log-likelihood of validation set for each kernel width
+lv <- rep(0, length(h_range))
+for (i in 1:length(h_range)) {
+  h <- h_range[i]
+  ph <- sapply(1:nrow(dv), function(x) kernel_density_2d(dv[x,], d, h))
+  lv[i] <- sum(log(ph))
+}
+
+# Find the bandwidth that maximizes the likelihood on the validation set
+h_best <- h_range[which.max(lv)]
+
+# Create a grid of points at which to evaluate the density
+grid <- expand.grid(V1 = seq(min(d[,1]), max(d[,1]), length.out = 100),
+                    V2 = seq(min(d[,2]), max(d[,2]), length.out = 100))
+
+# Evaluate the kernel density estimate at the points on the grid
+z <- matrix(sapply(1:nrow(grid), function(x) kernel_density_2d(as.numeric(grid[x,]), d, h_best)),
+            nrow = 100, ncol = 100)
+
+# Sort the grid's V1 and V2
+grid_sorted <- grid[order(grid$V1, grid$V2),]
+
+# Create the contour plot with the sorted grid
+filled.contour(sort(unique(grid_sorted$V1)), 
+               sort(unique(grid_sorted$V2)), 
+               z, color.palette = terrain.colors, 
+               xlab = "V1", ylab = "V2", 
+               main = "Estimated density")
+
+z_1 <- matrix(sapply(1:nrow(grid), function(x) kernel_density_2d(as.numeric(grid[x,]), d,0.25)),nrow = 100, ncol = 100)
+
+filled.contour(sort(unique(grid_sorted$V1)), 
+               sort(unique(grid_sorted$V2)), 
+               z_1, color.palette = terrain.colors, 
+               xlab = "V1", ylab = "V2", 
+               main = "Estimated density")
+```
+
+```{r}
+write.table(proj_1d, "umap_1d.txt", row.names=FALSE, col.names=FALSE)
+write.table(proj_2d, "umap_2d.txt", row.names=FALSE, col.names=FALSE)
+```
+
+```{r}
+set.seed(123)
+
+# Define the Gaussian kernel density estimator
+kernel_density <- function(x, d, h) {
+  K <- dnorm((x-d)/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h))
+}
+
+# Define the range of kernel widths to test
+h_range_1 <- seq(0.9, 3, by = 0.3)
+
+dv_1 <- sample(proj_1d,1200)
+
+d_1 <- setdiff(proj_1d,dv_1)
+
+# Compute log-likelihood of validation set for each kernel width
+lv_1 <- rep(0, length(h_range_1))
+for (i in 1:length(h_range_1)) {
+  h <- h_range_1[i]
+  ph <- sapply(dv_1, function(x) kernel_density(x, d_1, h))
+  lv_1[i] <- sum(log(ph))
+}
+
+h <- h_range_1[which.max(lv_1)]
+
+x <- seq(-25, 25, length.out = 1000)
+
+plot1 <- sapply(x, function(x) kernel_density(x, proj_1d, h))
+plot(x,plot1,type = "l", ylab = "density", main = "Kernel Density Estimation with h=0.9")
+
+par(mfrow = c(2, 2))
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 0.1))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=0.1")
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 0.5))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=0.5")
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 2))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=2")
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 3))
+plot(x,plot2,type = "l", ylab = "density", main = "Kernel Density Estimation with h=3")
+
+```
+
+```{r}
+# Define the kernel function
+K <- function(u) {
+  return(1/(sqrt(2*pi))*exp(-0.5*u^2))
+}
+
+mean_shift <- function(D, h, xi) {
+  tol <- 1e-3*h
+  T <- 10000
+  for (t in 1:T) {
+    # Compute the mean shift vector
+    m <- sum(K((D - xi)/h)*D)/sum(K((D - xi)/h))
+    # Check for convergence
+    if (max(abs(m - xi)) < tol) {
+      return(m)
+    }
+    # Update x
+    xi <- m
+  }
+  # If convergence is not achieved after T iterations, return NULL
+  return(NULL)
+  # else if convergence is not achieved after T iterations, return the last xi value
+  #return(xi)
+}
+
+# Test with point at t
+t <- 10
+prime <- mean_shift(proj_1d,h,t)
+plot(x,plot1,type = "l", ylab = "density", main = "Mean Clustering on KDE")
+plot_prime <- sapply(prime, function(x) kernel_density(x, proj_1d, h))
+plot <- sapply(t, function(x) kernel_density(x, proj_1d, h))
+points(prime,plot_prime,col = "red")
+points(t,plot,col = "blue")
+legend("topright", c("x'","x"), pch = 20, col = c("red", "blue"))
+```
+
+```{r}
+# Subset your data
+set.seed(123)  # for reproducibility
+idx <- sample(1:12000, 100, replace = FALSE)  # indices of the points you applied mean shift to
+mean_shift_data <- proj_1d[idx]  # the points you applied mean shift to
+remaining_data <- proj_1d[-idx]  # the points that remain
+x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(proj_1d, h, x))
+
+# KDE
+plot(x,plot1,type = "l", ylab = "density", main = "Mean Clustering on KDE")
+plot_prime <- sapply(x_prime_sub, function(x) kernel_density(x, proj_1d, h))
+points(x_prime_sub,plot_prime)
+```
+```{r}
+# Define function to find clusters
+find_clusters <- function(points, delta) {
+  # Sort the points in ascending order
+  points <- sort(points)
+  
+  # Initialize vector of cluster assignments
+  cluster_assignments <- rep(0, length(points))
+  
+  # Initialize cluster counter
+  cluster_count <- 1
+  
+  # Initialize first cluster
+  curr_cluster <- 1
+  
+  # Loop over remaining points
+  for (i in 1:length(points)) {
+    if (points[i] - points[curr_cluster] <= delta) {
+      # Add point to current cluster
+      cluster_assignments[i] <- cluster_count
+    } else {
+      # Start new cluster
+      curr_cluster <- i
+      cluster_count <- cluster_count + 1
+      cluster_assignments[i] <- cluster_count
+    }
+  }
+  
+  return(cluster_assignments)
+}
+
+delta <- 0.5
+
+clusters <- find_clusters(x_prime_sub, delta)-1
+
+clusters_unsorted <- NULL
+
+for (i in 1:length(x_prime_sub)) {
+  clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+}
+
+# Create scatter plot of data with cluster assignments
+plot(sort(mean_shift_data), clusters, pch=20, col="red", xlab = "x", ylab = "Cluster Assignment", xlim = c(-25,25))
+```
+
+```{r}
+# Prepare cluster assignments
+table(clusters_unsorted)
+# Use k-NN to assign remaining points to clusters
+remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                          test = matrix(remaining_data, ncol = 1), 
+                          cl = clusters_unsorted, 
+                          k = 3)
+
+# Combine cluster assignments
+all_clusters <- rep(-1,12000)
+
+all_clusters[idx] <- clusters_unsorted
+all_clusters[-idx] <- as.numeric(remaining_clusters)-1
+
+# Save cluster assignments to ASCII file
+write.table(all_clusters, "alg1_out.txt", row.names=FALSE, col.names=FALSE)
+```
+
+```{r}
+plot(x,plot1,type="l",ylim = c(0,0.045))
+points(proj_1d, (all_clusters/1000), cex=0.1, add = TRUE)
+# find the boundaries for each cluster
+table(all_clusters)
+group <- cbind(proj_1d,all_clusters)
+
+ranges <- list()
+for (i in 1:8) {
+  # filter the data for the current group
+  current_group_data <- group[group[,2] == i-1,]
+  
+  # check if there are any rows in the current_group_data
+  if(nrow(current_group_data) > 0){
+    ranges[[i]] <- range(current_group_data[,1])
+  } else {
+    ranges[[i]] <- c(NA, NA)  # assign NA if there are no observations in the current group
+  }
+}
+
+print(ranges)
+for (i in c(1,3,5,7)) {
+  abline(v = c(ranges[[i]][1], ranges[[i]][2]), col = "red", lty = 2, lwd = 0.5)
+}
+for (i in c(2,4,6,8)) {
+  abline(v = c(ranges[[i]][1], ranges[[i]][2]), col = "blue", lty = 2, lwd = 0.5)
+}
+```
+
+```{r}
+# Assuming data is your dataframe and it has columns x, y, and cluster
+plot(proj_2d[,1], proj_2d[,2], col = all_clusters+1, cex=0.1)
+```
+
+Try the package: 
+
+The result is not better using the package
+
+```{r}
+# The result is not better using the package
+result_mean <- meanShift(as.matrix(proj_2d), nNeighbors = 7, algorithm = "KDTREE", alpha = 0, bandwidth = c(0.06,0.06), iterations = 100, epsilonCluster = 0.7)
+# epsilonCluster is the minimal distance between clusters
+# bandwidth is the bandwidth
+# nNeighbors is the number of neighbors in k-NN
+# algorithm: A string indicating the algorithm to use for nearest neighbor searches. Currently, only "LINEAR" and "KDTREE" methods are supported.
+table(result_mean$assignment)
+data_pack <- cbind(proj_2d,result_mean$assignment)
+# Assuming data is your dataframe and it has columns x, y, and cluster
+plot(data_pack[,1], data_pack[,2], col = data_pack[,3], cex=0.1)
+```
+
+
+The following chunk for 2-D is discarded: 
+Clustering in 2-D:
+```{r eval=FALSE}
+#K <- function(u) {
+#  return(1/(2*pi)*exp(-0.5*sum(u^2)))
+#}
+#mean_shift <- function(D, h, xi) {
+#  tol <- 1e-3*h
+#  T <- 100
+#  for (t in 1:T) {
+#    # Compute the mean shift vector
+#    m <- colSums(sapply(1:nrow(D), function(i) K((D[i,] - xi)/h)*D[i,]))/sum(sapply(1:nrow(D), #function(i) K((D[i,] - xi)/h)))
+#    # Check for convergence
+#    if (max(abs(m - xi)) < tol) {
+#      return(m)
+#    }
+#    # Update x
+#    xi <- m
+#  }
+#  # If convergence is not achieved after T iterations, return NULL
+#  return(NULL)
+#}
+#find_clusters <- function(points, delta) {
+#   # Sort the points based on the Euclidean distance
+#   points <- points[order(rowSums(points^2)),]
+#   
+#   # Initialize vector of cluster assignments
+#   cluster_assignments <- rep(0, nrow(points))
+#   
+#   # Initialize cluster counter
+#   cluster_count <- 1
+#   
+#   # Initialize first cluster
+#   curr_cluster <- 1
+#   
+#   # Loop over remaining points
+#   for (i in 1:nrow(points)) {
+#     if (sqrt(sum((points[i,] - points[curr_cluster,])^2)) <= delta) {
+#       # Add point to current cluster
+#       cluster_assignments[i] <- cluster_count
+#     } else {
+#       # Start new cluster
+#       curr_cluster <- i
+#       cluster_count <- cluster_count + 1
+#       cluster_assignments[i] <- cluster_count
+#     }
+#   }
+#   
+#   return(cluster_assignments)
+# }
+# 
+# # Load the libraries
+# library(meanShiftR)
+# 
+# # Perform Mean-Shift clustering with the best bandwidth
+# final_result <- meanShift(embedding_2D, bandwidth=c(3,3), epsilon = 10)
+# 
+# # The cluster assignment for each point is stored in 'final_result$assignment'
+```
+
+Now try k-means (from the 2-D contour map, we most likely have 7/8/9/10 clusters)
+
+K-means Clustering: K-means is a simple yet effective algorithm for clustering data in any number of dimensions, including 2-D.
+
+```{r eval=FALSE}
+# set.seed(123)  # for reproducibility
+# k <- 7  # choose the number of clusters
+# result <- kmeans(data, centers = k)
+# clusters_km <- result$cluster  # the cluster assignments
+```
+
+DBSCAN: DBSCAN (Density-Based Spatial Clustering of Applications with Noise) is an algorithm that can find arbitrarily shaped clusters and can ignore noise. It's a good choice when the number of clusters is unknown. 
+
+```{r eval=FALSE}
+# # install.packages("fpc")
+# library(fpc)
+# result <- dbscan(embedding_2D, eps = 0.5, MinPts = 7)
+# clusters_db <- result$cluster
+```
+
+densityClust:
+
+You should look for an "elbow" or a "knee" in the decision graph where delta starts to increase rapidly. The point at which this increase occurs could be a good threshold value for delta, and the corresponding rho value could be a good threshold for rho.
+
+Note that you need to take into consideration the nature of your data, and how well the density peaks are separated. This method is subjective, and usually involves a bit of trial and error.
+
+```{r}
+# with t-SNE
+
+# set.seed(123)
+# library(densityClust)
+# step1 <- densityClust(embedding_2D, k = 311)  # adjust value as needed
+# step2 <- findClusters(step1,rho = 0.01,delta = 10)
+# # plotMDS(step1)
+# table(step2$cluster)
+# 
+# data_dense <- cbind(embedding_2D,step2$cluster)
+# # Assuming data is your dataframe and it has columns x, y, and cluster
+# plot(data_dense[,1], data_dense[,2], col = data_dense[,3])
+
+# with UMAP
+
+set.seed(123)
+library(densityClust)
+step1 <- densityClust(proj_2d, k = 111)  # adjust value as needed
+plot(step1, cex=0.1)
+step2 <- findClusters(step1,rho = 0.8,delta = 1.8)
+# plotMDS(step1)
+table(step2$cluster)
+
+data_dense <- cbind(proj_2d,step2$cluster)
+# Assuming data is your dataframe and it has columns x, y, and cluster
+plot(data_dense[,1], data_dense[,2], col = data_dense[,3], cex = 0.1)
+```
+
+In a decision graph, the `delta` value represents the distance of a point to a point with higher density. When the local density (`rho`) increases, it means that we're dealing with denser parts of the data, where data points are closer together. In such regions, it's likely to find a point with higher density nearby, and thus the `delta` value would typically decrease. 
+
+However, this general behavior can be influenced by the distribution and nature of your specific dataset. If your decision graph shows an increasing trend, it might indicate that data points with higher density do not necessarily have closer neighbors with even higher density. In other words, points in denser regions of your data are not necessarily surrounded by even denser regions.
+
+This can happen, for instance, in the case of elongated or irregularly shaped clusters, where points at the center of the cluster are surrounded by less dense border regions. It could also happen in datasets with noise, outliers, or subclusters within larger clusters.
+
+Remember, the aim of the decision graph is to help you visually identify clusters as outliers above the "background trend". Despite your trend being increasing, you can still use the graph to identify a suitable `rho` and `delta` threshold for clustering your data.
+
+Finally, also ensure that your data is suitably preprocessed (e.g., scaled) and that the correct distance metric is used for the density and distance calculations, as these factors can also affect the shape of the decision graph.
+
+```{r}
+all_clusters_2 <- NULL
+all_clusters_2 <- step2$cluster
+
+# Save cluster assignments to ASCII file
+write.table(all_clusters_2, "alg2_out.txt", row.names=FALSE, col.names=FALSE)
+```
+
+This clustering method seems separating some clusters a part, causing more clusters than it should be. However, this might be explained that with in each group, the density changes, and the density peak method captures these peaks, this may occur in some high dense areas.  
+

@@ -1,0 +1,946 @@
+---
+title: "An Explorative Study on Data Clustering:"
+subtitle: "SP 23 Stat 527A project"
+author: "Anqi Zhao"
+date: "2023-05-30"
+output: pdf_document
+geometry: left=0.75in, right=0.75in, top=1in, bottom=0.5in
+indent: true
+---
+
+# 0. Introduction
+
+
+&nbsp;&nbsp;&nbsp;&nbsp;This report presents an in-depth analysis utilizing clustering techniques to explore our data set. Our focus lies primarily on density-based clustering, an approach that identifies clusters of points in regions of higher density compared to the remainder of the data set. The main objectives of this study are to evaluate the robustness and reliability of two clustering methods, mean-shift, and density-peak clustering algorithms. I'm also interested in examining the stability of these clusters under different parameters and settings.
+
+In this report, I will walk through the clustering process, discuss the rationale behind my methodological choices, and present the results of my analyses in a clear and comprehensible manner. To save some more space, the plots along this report are relatively small, but if this is viewed online, then "zoom in" would help; if this is printed out, the full-size graphs are available in the Appendix.
+
+```{r echo=FALSE, message=FALSE}
+# Import the data
+setwd("/Users/keon/Desktop/Stat 527A/project")
+library(readr)
+library(uwot)
+library(dbscan)
+library(ggplot2)
+library(plotly)
+library(Rtsne)
+library(class)
+library(meanShiftR)
+library(clue)
+library(knitr)
+library(kableExtra)
+project_data <- read_csv("project-data.csv", col_names = FALSE)
+data <- as.matrix(project_data)
+```
+
+# I. Preprocessing
+
+
+&nbsp;&nbsp;&nbsp;&nbsp;Given the high-dimensional nature of our data set (12,000 observations across 64 dimensions), direct clustering would have been computationally intensive and potentially less meaningful due to the "curse of dimensionality."[^1] Therefore, a preprocessing step was necessary to reduce the dimensionality of the data and improve the efficiency and interpretability of our clustering algorithm.
+
+[^1]: An example: the kernel density estimate can become less stable in higher dimensions.
+
+Observing that each feature is centered at 0-0.03 and we don't know the meaning/unit of each feature, we, for now, choose to not standardize the data. (Actually, I tried to standardize the data, but the resulting clusters seem too close to each other, which may indicate that standardization hurts distinct features of data, so I then consider using the raw data.) We used Uniform Manifold Approximation and Projection (UMAP)[^2] for this step. Recall that UMAP is a dimension reduction technique that is particularly well-suited for high dimensional data, and preserves the global data structure as well as local relationships within the data, which makes it a good choice for our needs. [^3]
+
+[^2]: Theoretically, UMAP operates by first constructing a high-dimensional graph representation of the data, and then optimizing a low-dimensional version of the graph to be as structurally similar as possible. This effectively maintains the essential topological structure of the data set when it is embedded in the lower dimensional space. Notice here, the dimension reduction via UMAP is a form of unsupervised preprocessing that does not rely on any labels or prior information about the data. Therefore, it was an appropriate step to take before applying our unsupervised mean-shift and density peak clustering algorithm.
+
+[^3]: Later in the evaluation section, I'll also try Principal Component Analysis (PCA) and perform t-Distributed Stochastic Neighbor Embedding (t-SNE) and compare its performance with UMAP.
+
+To visualize the data and clustering results straightforwardly and intuitively, I transformed the original 64-dimensional data into a more manageable 2-dimensional representation and a 1-dimensional representation. Fig. 1 is a plot of the UMAP-processed data in 2-D, and we can see that the data forms about 8 clusters. The distance between each cluster is relatively large, and there aren't points scattered in between these clusters, so it seems appropriate to perform mean-shift and density-peak clustering on the data with such characteristics. However, we should notice that a clear cluster structure may not imply its accuracy, and we will have to explain this later in the evaluation, but for now, we can use these data for clustering.  
+
+```{r echo=FALSE, fig.width=4, fig.height=3,fig.align='center'}
+set.seed(123)
+proj_1d <- umap(data, n_neighbors=30, n_components=1)
+proj_2d <- umap(data, n_neighbors=30, n_components=2)
+plot(proj_2d[,1],proj_2d[,2],cex=0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Fig. 1")
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;Now I have two preprocessed data: one is by performing 1-D UMAP, which will be used for the mean-shift algorithm; another one is by performing 2-D UMAP, which will be used for the density peak clustering algorithm. [^4] [^5]
+    
+[^4]: For reproductivity, set.seed(123) for the whole paper. 
+
+[^5]: We used function umap() here and set parameter 'n_neighbors = 30' indicates the size of the local neighborhood used for manifold approximation; 'n_components = d' for target dimension d. Code will be provided as ".Rmd" file along with this report.
+
+# II. Methods and Clustering Results
+
+## II.I Mean Shift Clustering Algorithm
+
+
+&nbsp;&nbsp;&nbsp;&nbsp;My first clustering method is Mean-Shift (Comaniciu-Meer), and as we are already familiar with how it works during the lecture, I'd focus more on how I select the parameters and explain less why and how this algorithm works. 
+
+This variation of the Mean-shift algorithm is very similar to the standard one, and the only difference is that we don't look at the convergent point of all data. Instead, we make a subset from the data and check their convergent points. With a small tolerance $\delta$, we assign data with convergent points within the range $[-\delta,\delta]$ into the same cluster. Finally, for the remaining data, we use k-NN to assign each of them a cluster. 
+
+In one dimension, we need to have the kernel density estimation (KDE) available to perform the mean-shift algorithm, so we first should choose an appropriate bandwidth h (smooth parameter) to construct the estimated kernel density. Here I used cross-validation [^6] to select from a set of possible candidates, more specifically $h \in \{0.01,0.02,...,2\}$. 
+
+[^6]: As what we did in Stat 527 Assignment 1. I selected 10% (1200) of the data as a validation set, and the rest of them as a training set, then compared the likelihoods with different h. 
+
+```{r echo=FALSE}
+set.seed(123)
+
+# Define the Gaussian kernel density estimator
+kernel_density <- function(x, d, h) {
+  K <- dnorm((x-d)/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h))
+}
+
+# Define the range of kernel widths to test
+h_range_1 <- seq(0.9, 2, by = 0.1)
+
+# h_range_1 <- seq(0.01, 2, by = 0.01) 
+# this is what we used for cross validation, and h_max = 0.07
+
+dv_1 <- sample(proj_1d,1200)
+
+d_1 <- setdiff(proj_1d,dv_1)
+
+# Compute log-likelihood of validation set for each kernel width
+lv_1 <- rep(0, length(h_range_1))
+for (i in 1:length(h_range_1)) {
+  h <- h_range_1[i]
+  ph <- sapply(dv_1, function(x) kernel_density(x, d_1, h))
+  lv_1[i] <- sum(log(ph))
+}
+
+h <- h_range_1[which.max(lv_1)]
+
+# h = 0.07 by cross-validation
+
+x <- seq(-25, 25, length.out = 1000)
+```
+
+
+```{r echo=FALSE, fig.width=7, fig.height=3}
+# Define layout matrix
+layout_mat <- matrix(c(1,1,2,3,1,1,4,5), nrow = 2, byrow = TRUE)
+
+# Set the layout according to the matrix
+layout(layout_mat)
+
+# Decrease the margin
+par(mar=c(2,2,2,2)) 
+
+plot1 <- sapply(x, function(x) kernel_density(x, proj_1d, h))
+plot(x,plot1,type = "l", ylab = "density", main = "KDE with h=0.9 Fig.2")
+
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 0.07))
+plot(x,plot2,type = "l", ylab = "density", main = "KDE with h=0.07")
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 0.5))
+plot(x,plot2,type = "l", ylab = "density", main = "KDE with h=0.5")
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 1.5))
+plot(x,plot2,type = "l", ylab = "density", main = "KDE with h=1.5")
+
+plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, 2.5))
+plot(x,plot2,type = "l", ylab = "density", main = "KDE with h=2.5")
+
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;By cross-validation, the optimal h selected from {0.01,0.02,...,2} is 0.07, but if we plot it, we'll see that it's very sharp.[^7] Based on what we learned in the lecture, we may think there's too much variation with the estimation when h = 0.07. Then comparing the KDE graphs with various h, I finally selected h = 0.9, and by Fig.2, we can see that it seems true that this bandwidth gives a less biased while smooth plot among other candidates. 
+
+[^7]: The cross-validation technique for selecting the bandwidth h in density estimation tries to balance the bias-variance trade-off. But it can sometimes produce sub-optimal results due to a few reasons like noise in the data and the presence of outliers. 
+
+Also, if we count the number of peaks of the estimated kernel density f with h = 0.9, we can find 8 of them, which is the same/ very close to the number of clusters we can see from Fig.1. Then since each density peak will finally result in a cluster in mean-shift algorithm when data is large enough, we indirectly have a feeling that our estimated density is trustworthy. 
+
+```{r echo=FALSE}
+# Define the kernel function
+K <- function(u) {
+  return(1/(sqrt(2*pi))*exp(-0.5*u^2))
+}
+
+mean_shift <- function(D, h, xi) {
+  tol <- 1e-3*h
+  T <- 10000
+  for (t in 1:T) {
+    # Compute the mean shift vector
+    m <- sum(K((D - xi)/h)*D)/sum(K((D - xi)/h))
+    # Check for convergence
+    if (max(abs(m - xi)) < tol) {
+      return(m)
+    }
+    # Update x
+    xi <- m
+  }
+  # If convergence is not achieved after T iterations, return NULL
+  return(NULL)
+  # else if convergence is not achieved after T iterations, return the last xi value
+  #return(xi)
+}
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;Since the large data size, it's computationally intensive for us to find the convergent point for each data as the Standard Mean-shift does. Then we select 200 points[^8] (from data) that cover the data well, and for each of these points, we find its convergent point after enough iterations. With a tolerance $\delta=0.5$, we assign points with close convergence to one cluster. Notice here our $\delta$ might be too large for some other data, but since we know there aren't two peaks that have distance $\leq 2$, then this $\delta$ should work. By experiments[^9], I allow maximum T = 10000 iterations for the selected points to reach the max f. I'd like to mention that, we can also check the convergence plot (see Fig.3) of these selected points, all the peaks are reached, so we might have an idea that our selected points cover the data well.  
+
+Note: Here I would like to mention that, the clustering result following this report's code is slightly different from the one I submitted on Canvas. The only change I made is that I selected only 100 points in that one, but while I'm writing this report, I think it'll make my result more accurate if I start with more points. This seems to improve the performance of k-NN when assigning the clusters for the remaining points.
+
+[^8]: More points could be selected, for example, 10% of the full data, but to reduce the time consumption, I use 200. 
+
+[^9]: We also tried T=100, and T=1000, but they are not enough for some points.
+
+
+```{r echo=FALSE, fig.width=4, fig.height=3,fig.align='center'}
+# Subset your data
+set.seed(123)  # for reproducibility
+idx <- sample(1:12000, 200, replace = FALSE)  # indices of the points you applied mean shift to
+mean_shift_data <- proj_1d[idx]  # the points you applied mean shift to
+remaining_data <- proj_1d[-idx]  # the points that remain
+x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(proj_1d, h, x))
+
+# KDE
+plot(x,plot1,type = "l", ylab = "density", main = "Mean Clustering on KDE Fig.3")
+plot_prime <- sapply(x_prime_sub, function(x) kernel_density(x, proj_1d, h))
+points(x_prime_sub,plot_prime)
+```
+
+```{r echo=FALSE}
+# Define function to find clusters
+find_clusters <- function(points, delta) {
+  # Sort the points in ascending order
+  points <- sort(points)
+  
+  # Initialize vector of cluster assignments
+  cluster_assignments <- rep(0, length(points))
+  
+  # Initialize cluster counter
+  cluster_count <- 1
+  
+  # Initialize first cluster
+  curr_cluster <- 1
+  
+  # Loop over remaining points
+  for (i in 1:length(points)) {
+    if (points[i] - points[curr_cluster] <= delta) {
+      # Add point to current cluster
+      cluster_assignments[i] <- cluster_count
+    } else {
+      # Start new cluster
+      curr_cluster <- i
+      cluster_count <- cluster_count + 1
+      cluster_assignments[i] <- cluster_count
+    }
+  }
+  
+  return(cluster_assignments)
+}
+
+delta <- 0.5
+
+clusters <- find_clusters(x_prime_sub, delta)-1
+
+clusters_unsorted <- NULL
+
+for (i in 1:length(x_prime_sub)) {
+  clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+}
+
+table(clusters)
+```
+
+
+&nbsp;&nbsp;&nbsp;&nbsp;Then for the remaining points, I used the k-Nearest Neighbor method to assign each of them to a cluster. In this case, I chose to use 3-NN. In this algorithm, the 3 nearest neighbors' cluster assignment is checked, and a new point will be assigned to the cluster that includes at least two of the neighbors.[^10]
+
+[^10]: Here in the code, I used function knn() to perform the k-NN algorithm. The parameters I set were: "train = *100 selected data points*", "test = *remaining data*", "cl = *cluster assignment for selected points*", and "k = 3" which indicates the number of neighbors that we care. 
+
+Fig.4 shows the estimated density with clustering results. The dashed lines indicate the boundaries of the clusters, and the black lines/dots under the density curve are our data points in 1-D. We can observe that approximately the boundaries are at the local minimum of the density, which implies that our data are assigned to the cluster that their neighbors are at. 
+
+However, we should also notice that some boundaries are not exactly at the minimum of f, (especially the one around x=3), this means that points with values close to 3 are possibly misclassified to another cluster. 
+
+```{r echo=FALSE}
+# Use k-NN to assign remaining points to clusters
+remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                          test = matrix(remaining_data, ncol = 1), 
+                          cl = clusters_unsorted, 
+                          k = 3)
+
+# Combine cluster assignments
+all_clusters <- rep(-1,12000)
+
+all_clusters[idx] <- clusters_unsorted
+all_clusters[-idx] <- as.numeric(remaining_clusters)-1
+
+# Save cluster assignments to ASCII file
+# write.table(all_clusters, "alg1_out.txt", row.names=FALSE, col.names=FALSE)
+```
+
+```{r echo=FALSE, fig.width=8, fig.height=3}
+
+par(mfrow = c(1, 2))
+plot(x,plot1,type="l",ylim = c(0,0.045), ylab = "density", main = "Fig.4")
+points(proj_1d, (all_clusters/1000), cex=0.05)
+# find the boundaries for each cluster
+group <- cbind(proj_1d,all_clusters)
+
+ranges <- list()
+for (i in 1:8) {
+  # filter the data for the current group
+  current_group_data <- group[group[,2] == i-1,]
+  
+  # check if there are any rows in the current_group_data
+  if(nrow(current_group_data) > 0){
+    ranges[[i]] <- range(current_group_data[,1])
+  } else {
+    ranges[[i]] <- c(NA, NA)  # assign NA if there are no observations in the current group
+  }
+}
+
+for (i in c(1,3,5,7)) {
+  abline(v = c(ranges[[i]][1], ranges[[i]][2]), col = "red", lty = 2, lwd = 0.5)
+}
+for (i in c(2,4,6,8)) {
+  abline(v = c(ranges[[i]][1], ranges[[i]][2]), col = "blue", lty = 2, lwd = 0.5)
+}
+
+# Assuming data is your data frame and it has columns x, y, and cluster
+plot(proj_2d[,1], proj_2d[,2], col = all_clusters+1, cex=0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Fig. 5")
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;See Fig.5, now we can plot our data in 2-D [^11], coloring the points by their assigned clusters. Since we are coloring higher(2) dimensional data by lower(1) dimensional clustering results, we expect to observe some "mistakes" shown in the figure, more comments on this will be at the end of the evaluation section. 
+
+[^11]: Recall we obtain this 2-D data using UMAP but haven't used it yet other than graph illustration. 
+
+Also, I would like to mention that, I wrote the code for this mean-shift algorithm, since when I was trying to use the package, the result isn't better than my code. (I think the reason is that the package is more complex than my method, so more parameters need to be considered.) 
+
+By cross-validation, the optimal bandwidth for 2-D data is (0.06,0.06), and the clustering result is shown in Fig. 6. Since the result doesn't seem so good, I didn't submit my result using the package. [^12]
+
+[^12]: Here the function I used was "meanShift()", with parameters: "nNeighbors=7" is the number of neighbors in k-NN; "algorithm="KDTREE"": A string indicating the algorithm to use for nearest neighbor searches; "bandwidth=c(0.06,0.06)" is the bandwidth; "epsilonCluster=0.7" is the minimal distance between clusters.
+
+```{r echo=FALSE}
+set.seed(123)
+v <- sample(1:12000, 1200, replace = FALSE)
+dv <- proj_2d[v,]
+d <- proj_2d[-v,]
+
+# Define the Gaussian kernel density estimator for 2 dimensions
+kernel_density_2d <- function(x, d, h) {
+  diff <- sweep(d, 2, x, "-")
+  K <- dnorm(sqrt(rowSums(diff^2))/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h^2))
+}
+
+# Define the range of kernel widths to test
+# The upper bound is 2 since we also tested for 
+# h_range <- seq(2, 10, by = 1) and h_range <- seq(10, 50, by = 2)
+# the h_best are always reported as the lower bound
+h_range <- seq(0.01, 0.1, by = 0.01)
+
+# Compute log-likelihood of validation set for each kernel width
+lv <- rep(0, length(h_range))
+for (i in 1:length(h_range)) {
+  h <- h_range[i]
+  ph <- sapply(1:nrow(dv), function(x) kernel_density_2d(dv[x,], d, h))
+  lv[i] <- sum(log(ph))
+}
+
+# Find the bandwidth that maximizes the likelihood on the validation set
+h_best <- h_range[which.max(lv)]
+```
+
+```{r echo=FALSE, fig.width=3.8, fig.height=3}
+# The result is not better using the package
+result_mean <- meanShift(as.matrix(proj_2d), nNeighbors = 7, algorithm = "KDTREE", bandwidth = c(h_best,h_best), iterations = 100, epsilonCluster = 0.7)
+# epsilonCluster is the minimal distance between clusters
+# bandwidth is the bandwidth
+# nNeighbors is the number of neighbors in k-NN
+# algorithm: A string indicating the algorithm to use for nearest neighbor searches. Currently, only "LINEAR" and "KDTREE" methods are supported.
+table(result_mean$assignment)
+
+data_pack <- cbind(proj_2d,result_mean$assignment)
+# Assuming data is your data frame and it has columns x, y, and cluster
+plot(data_pack[,1], data_pack[,2], col = data_pack[,3]+1, cex=0.05, xlab = "dimension 1", ylab = "dimension 2", main = "mean-shift (R package) Fig. 6")
+# Create a grid of points at which to evaluate the density
+grid <- expand.grid(V1 = seq(min(d[,1]), max(d[,1]), length.out = 100),
+                    V2 = seq(min(d[,2]), max(d[,2]), length.out = 100))
+
+# Evaluate the kernel density estimate at the points on the grid
+z <- matrix(sapply(1:nrow(grid), function(x) kernel_density_2d(as.numeric(grid[x,]), d, h_best)),
+            nrow = 100, ncol = 100)
+
+# Sort the grid's V1 and V2
+grid_sorted <- grid[order(grid$V1, grid$V2),]
+
+# Create the contour plot with the sorted grid
+filled.contour(sort(unique(grid_sorted$V1)), 
+               sort(unique(grid_sorted$V2)), 
+               z, color.palette = terrain.colors, 
+               xlab = "dimension 1", ylab = "dimension 2", 
+               main = "Estimated density")
+```
+
+## II.II Density Peak Clustering Algorithm [^13]
+
+
+[^13]: Alex Rodriguez, Alessandro Laio ,Clustering by fast search and find of density peaks.Science344,1492-1496(2014).DOI:10.1126/science.1242072 
+
+&nbsp;&nbsp;&nbsp;&nbsp;This is an algorithm that we didn't cover during the lecture, but it also belongs to the peak finding algorithm family as mean-shift, and its logic is intuitive as we are already familiar with mean-shift, k-NN, and DBscans. 
+
+Theoretically, the Density Peak Clustering Algorithm contains five stages:[^14]
+
+1. **Calculate Local Density**: The first step of the algorithm involves calculating the local density of data points. This is typically done using a Gaussian kernel, which gives a higher weight to points that are closer together. In other words, areas of the data space where points are densely packed together are assigned a higher local density.
+
+2. **Calculate Distance to Higher Density**: For each data point, the algorithm calculates the minimum distance to a point with higher density, which provides a measure of how far a point is from a denser region of the data space.
+
+3. **Identify Clusters Centers**: Points that have a high local density and a large distance to any point with a higher density are identified as cluster centers. The rationale is that these points are likely to be in the center of a cluster, as they are surrounded by points of lower density.
+
+4. **Assign Points to Clusters**: Once the cluster centers have been identified, each remaining point is assigned to the same cluster as its nearest neighbor of higher density. This process continues until all points have been assigned to a cluster.
+
+5. **Refine Clusters**: In some implementations of the algorithm, a final step may involve refining the clusters by reassigning points based on some criteria (such as distance to the cluster center) to improve the quality of the clusters.
+
+[^14]: In our case, we don't need to write our own code. Instead, we can call the package "densityClust" and simply adjust the parameters. 
+
+In our case, using the package to do the clustering involves only two steps, the first step is to call the function "densityClust()", then we can use the obtained values in the function "findClusters()" to get the cluster assignment.  
+
+Step 1: 
+
+```{r}
+set.seed(123)
+library(densityClust)
+step1 <- densityClust(proj_2d, k = 111) 
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;This performs the first step of the density clustering algorithm on my 2-D data named: *proj_2d*. The k =111 [^15] parameter here denotes the number of nearest neighbors to consider when estimating the density of points. Our variable called *step1* now stores all information needed in theory stages 1 to 3, but for now, the clusters are not yet assigned. 
+
+[^15]: The number of nearest neighbors is decided by taking the root of the number of total data $\sqrt{12,000}$, and this value is suggested by Rodriguez and Laio. 
+
+Step 2:
+
+```{r}
+step2 <- findClusters(step1,rho = 0.8,delta = 1.8)
+# We can also do findClusters(step1,rho = step1$rho,delta = step1$delta), 
+# which is suggested by the author
+# However, doing it causes error such that asking for a larger k value in densityClust()
+table(step2$cluster)
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;Then to assign the clusters,[^16] we need to use the function "findClusters()". There are two parameters that we need to fill, and they are called $\delta$ and $\rho$, which are the keys to this algorithm. In terms of meanings, $\rho$ is the local density that is a measure of how many nearby neighbors each point has; $\delta$ is the minimum distance to any point with higher density, and it is a measure of the closest distance from a point to another point which has a higher $\rho$.
+
+Therefore, how to select $\delta$ and $\rho$ becomes significant to our clustering. One way that the contributors of this package suggested was to look at the decision graph. Generally, we should look for an "elbow" or a "knee" in the decision graph where $\delta$ starts to increase rapidly. The point at which this increase occurs could be a good threshold value for $\delta$, and the corresponding $\rho$ value could be a good threshold for $\rho$. In our case, that's why I selected *rho = 0.8, delta = 1.8*. However, in the author of this package's paper, their higher value of $\delta$ corresponds to the lower value of $\rho$, which is not the case in our decision graph. Therefore, there is a possibility that we made mistakes, but there's also a chance that this is correct due to the nature of our data, e.g. how well the density peaks are separated. 
+
+[^16]: This corresponds to stages 4 and 5 in theory. 
+
+```{r echo=FALSE, fig.width=4, fig.height=3,fig.align='center'}
+plot(step1, cex=0.05)
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;Therefore, the Fig.7 shows our clustering result. This clustering method seems to separate some clusters a part, causing more clusters than it seems. However, if there's an error, this might be explained that within each group, the density varies, and the density peak method captures these peaks, which may occur in some highly dense areas.  
+
+```{r echo=FALSE, fig.width=6, fig.height=4,fig.align='center'}
+data_dense <- cbind(proj_2d,step2$cluster)
+# Assuming data is your data frame and it has columns x, y, and cluster
+plot(data_dense[,1], data_dense[,2], col = data_dense[,3], cex = 0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Density Peak Fig.7")
+```
+
+
+## II.III K-means Clustering Algorithm
+
+&nbsp;&nbsp;&nbsp;&nbsp;The density peak clustering algorithm is computationally efficient and can be effective in identifying clusters in complex and large-scale data sets. Also, it's not taught during lectures, so it's available for some free explorations. That's why I finally chose the density peak algorithm, but I also thought about and tried parametric clustering methods like k-means. From the 2-D plots given by UMAP, we have a feeling that the number of clusters might be around 7 to 10, then we can do k-means. However, since we don't know the true number of clusters, guessing one could be very risky, and the result doesn't seem good, so it's more like a small one here. One thing to notice here is, unlike my mean-shift code and the density peak package, the "kmeans()" function takes the original high dimensional data as input. 
+
+See Fig.8, the eight plots are output from calling *kmeans(df, centers = k)*, while *df* could be the original 64-D data and the 2-D data. 
+
+```{r echo=FALSE, fig.width=6, fig.height=4,fig.align='center'}
+set.seed(123)  # for reproducibility
+# Main title for all plots
+par(mfrow = c(2, 2))  # create a 2x2 grid of plots
+par(mar = c(1, 1, 2.5, 1))
+for(k in 7:10) {
+  result <- kmeans(data, centers = k) # data is the original data in 64-D
+  clusters_km <- result$cluster  # the cluster assignments
+  plot(data_pack[,1], data_pack[,2], col = clusters_km, cex=0.05, xlab = "dimension 1", 
+       ylab = "dimension 2", main = paste("k-means", k, "clusters"))
+}
+mtext("K-means using 64-D data Fig.8", outer = TRUE, line = -1, cex = 1)
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=4,fig.align='center'}
+set.seed(123)  # for reproducibility
+# Main title for all plots
+par(mfrow = c(2, 2))  # create a 2x2 grid of plots
+par(mar = c(1, 1, 2.5, 1))
+for(k in 7:10) {
+  result <- kmeans(proj_2d, centers = k) # data is the 2-D data
+  clusters_km <- result$cluster  # the cluster assignments
+  plot(data_pack[,1], data_pack[,2], col = clusters_km, cex=0.05, xlab = "dimension 1", 
+       ylab = "dimension 2", main = paste("k-means", k, "clusters"))
+}
+mtext("K-means using 2-D data", outer = TRUE, line = -1, cex = 1)
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;I also thought about why the plots in higher dimensional don't look good and came up with two possible reasons that the k-means method might be unstable in high dimensions, and my dimension reduction isn't good. (or it can also be both.) As long as I know and I searched online, k-means can be unstable as the dimension increases as it uses Euclidean distance to assign points to clusters. As dimension increases, the distance between any two points in the space becomes more similar, making it harder to find meaningful clusters. [^17] Also, it is sensitive to the initial selection of centroids. In higher dimensions, this initialization problem becomes even more pronounced, as there is an increased chance that the algorithm might converge to a local rather than global optimum.
+
+[^17]: This is known as the curse of dimensionality.
+
+
+
+# III. Evaluation
+
+&nbsp;&nbsp;&nbsp;&nbsp; Here as we already have two clustering results, it's important for us to know if our clustering is stable or not for several reasons:
+
+1. **Reliability**: If a clustering algorithm provides different results with small changes in the data set (such as slight perturbations in the data or varying the initial parameters), it may suggest that the discovered clusters are not reliable or not real. Unstable clustering can lead to different interpretations of data, which can be problematic in decision-making processes.
+
+2. **Confidence in Results**: Stability provides a measure of confidence in the results. If clusters remain relatively unchanged across multiple runs of the algorithm, it gives us more confidence that we're not just seeing random patterns.
+
+3. **Generalization**: Stable clusters are more likely to be meaningful and generalizable to new, unseen data. This is particularly important if the clustering model is used to make predictions on new data.
+
+This section involves four parts. The first part is to test my mean-shift clustering by re-sampling in 2-D; the second part is to test mean-shift by varying bandwidth h in 2-D; the third part is to try different dimensional reduction[^18] methods and comparing the clustering results using mean-shift; the last part is to test my density-peak clustering by adding new clusters.
+
+[^18]: I tried t-SNE and PCA as alternative methods.
+
+## III.I Mean-Shift (resampling)
+
+&nbsp;&nbsp;&nbsp;&nbsp; Recall from method section II.I, I explained the Mean-Shift (Comaniciu-Meer) algorithm and highlighted its difference from the standard mean-shift such that it finds the convergent points of a subset of the data and it used k-NN to assign the remaining data. Therefore, to evaluate our clustering, I repeat the whole process 100 times, and each time I should have different sampled data and different clustering. Finally, the average misclassification error (ME) distance is calculated. 
+
+My resulting clustering matrix had a size of 12,000X100, and the confusion matrix and ME distance are calculated between each pair of clustering. Based on the function I wrote, the output would be a 100X100 upper triangular matrix with [i,j] element means the ME distance between i-th and j-th clustering. 
+
+The result is 0.01588189, which means that the average variation of clusters by re-sampling is around 1.59%. This seems to be a good sign that only a small portion of data is classified into different clusters.[^19] [^20]
+
+[^19]: Here I omitted some plots and the concepts of ME distance since we already discussed them during the lecture. The function I wrote to find the ME distance is available in the Rmd file. 
+
+[^20]: For now, I'd like to consider $\alpha=0.05$ as a threshold of whether the distance is small enough. This is a naive but intuitive way to set a level, and more information about ME distance interpretation and requirements is in the next section. 
+
+```{r echo=FALSE}
+# Rename the data
+result1 <- all_clusters+1
+# We make sure the first group index starts from 1
+result2 <- step2$cluster
+data_umap_1d <- proj_1d
+data_umap_2d <- proj_2d
+```
+
+```{r echo=FALSE,eval=FALSE}
+set.seed(123)
+# Initialize an empty matrix to store cluster assignments from each iteration
+all_clusters_matrix <- matrix(NA, nrow = 12000, ncol = 100)
+
+delta <- 0.5
+
+h <- 0.9
+
+# Repeat the procedure 10 times
+for (j in 1:100) {
+  # Resample your data
+  set.seed(j*123)  # for reproducibility
+  idx <- sample(1:12000, 100, replace = FALSE)  # indices of the points you applied mean shift to
+  mean_shift_data <- data_umap_1d[idx]  # the points you applied mean shift to
+  remaining_data <- data_umap_1d[-idx]  # the points that remain
+  x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(data_umap_1d, h, x))
+  
+  # Find clusters
+  clusters <- find_clusters(x_prime_sub, delta)-1
+  
+  clusters_unsorted <- NULL
+  for (i in 1:length(x_prime_sub)) {
+    clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+  }
+
+  # Use k-NN to assign remaining points to clusters
+  remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                            test = matrix(remaining_data, ncol = 1), 
+                            cl = clusters_unsorted, 
+                            k = 3)
+  
+  # Combine cluster assignments
+  all_clusters <- rep(-1,12000)
+  all_clusters[idx] <- clusters_unsorted
+  all_clusters[-idx] <- as.numeric(remaining_clusters)-1
+
+  # Store this iteration's cluster assignments in the matrix
+  all_clusters_matrix[,j] <- all_clusters
+}
+
+```
+
+```{r echo=FALSE}
+# This function takes two vectors of cluster assignments and computes the 
+# misclassification error
+calc_misclassification_error <- function(cluster1, cluster2) {
+  confusion_matrix <- table(cluster1, cluster2)
+  cm <- confusion_matrix / sum(confusion_matrix)
+  large_number <- max(cm) * nrow(cm)
+  new_cm <- large_number - cm
+  solution <- solve_LSAP(new_cm)
+  cm_optimized <- cm[, solution]
+  me <- 1 - sum(diag(cm_optimized))
+  return(me)
+}
+
+# This function takes a data matrix where each column represents a different 
+# clustering result
+calc_misclassification_matrix <- function(data) {
+  # Get the number of columns
+  n <- ncol(data)
+  
+  # Initialize a matrix to store the misclassification errors
+  me_matrix <- matrix(NA, n, n)
+  
+  # Loop over each pair of columns
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      # Calculate the misclassification error for this pair of columns
+      me_matrix[i, j] <- calc_misclassification_error(data[, i], data[, j])
+    }
+  }
+  
+  # Return the resulting matrix
+  return(me_matrix)
+}
+```
+
+```{r echo=FALSE, message=FALSE,eval=FALSE}
+# Apply the function to your matrix
+dME_matrix <- calc_misclassification_matrix(all_clusters_matrix)
+sum(dME_matrix, na.rm = TRUE)/(100*99/2)
+```
+
+## III.II Mean-Shift (varying bandwisth h)
+
+&nbsp;&nbsp;&nbsp;&nbsp;For this part, I varied my bandwidth h=0.9 a little bit to see if it affects the clustering a lot. If it does, then my clustering might be unstable. The KDE plots in 1-D with h = 0.5 to 1.3 is right after this page, and it's not hard to see that the number and range of the peaks doesn't change too much within h = 0.7 to h = 1, therefore we may expect the clustering results don't change too much as we vary for h within this range. 
+
+```{r echo=FALSE,eval=FALSE}
+# Define the range of h values
+h_values <- seq(0.5, 1.3, by = 0.1)
+
+# Open a graphics device to save the plots in a pdf file
+pdf("Kernel_Density_Estimation_Plots.pdf")
+
+par(mfrow = c(3, 3))
+
+# Loop over h values
+for(h in h_values) {
+  # Compute kernel density
+  plot2 <- sapply(x, function(x) kernel_density(x, proj_1d, h))
+  
+  # Plot the results
+  plot(x, plot2, type = "l", ylab = "density", 
+       main = paste("KDE with h =", round(h,2)))
+}
+
+# Close the graphics device
+dev.off()
+```
+
+Then I did the clustering with h = {0.7,0.8,0.9,1.0} and compute the average ME distance to check how a small vary of bandwidth h affects my result. The calculated ME distance is 0.04308333, which could be interpreted as "about 4.3% of my data points are misclassified". [^21]
+
+[^21]: Whether this value is small enough or not depends on the context. I discussed a little bit when a very small ME distance is required in the next section. (Discussion and Conclusion)
+
+```{r echo=FALSE, message=FALSE,eval=FALSE}
+set.seed(123)  # for reproducibility
+# Function to perform clustering
+perform_clustering <- function(h) {
+  # Subset your data
+  idx <- sample(1:12000, 200, replace = FALSE)  # indices of the points you applied mean shift to
+  mean_shift_data <- proj_1d[idx]  # the points you applied mean shift to
+  remaining_data <- proj_1d[-idx]  # the points that remain
+  x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(proj_1d, h, x))
+  delta <- 0.5
+  
+  clusters <- find_clusters(x_prime_sub, delta)-1
+  
+  clusters_unsorted <- NULL
+  
+  for (i in 1:length(x_prime_sub)) {
+    clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+  }
+  
+  # Use k-NN to assign remaining points to clusters
+  remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                            test = matrix(remaining_data, ncol = 1), 
+                            cl = clusters_unsorted, 
+                            k = 3)
+  
+  # Combine cluster assignments
+  all_clusters <- rep(-1,12000)
+  
+  all_clusters[idx] <- clusters_unsorted
+  all_clusters[-idx] <- as.numeric(remaining_clusters)-1
+  
+  return(all_clusters)
+}
+
+# Initialize a matrix to store the clustering result
+clustering_result <- matrix(nrow = 12000, ncol = 4)
+
+# Perform clustering with different h values and store the results
+h_values <- c(1.0, 0.8, 0.9, 0.7)
+for (i in 1:length(h_values)) {
+  clustering_result[, i] <- perform_clustering(h_values[i])
+}
+
+# Apply the function to your matrix
+dME_matrix <- calc_misclassification_matrix(clustering_result)
+sum(dME_matrix, na.rm = TRUE)/(4*3/2)
+```
+
+## III.III Mean-Shift (using different dimension reduction methods)
+
+&nbsp;&nbsp;&nbsp;&nbsp;Our above computations and evaluations of our clustering all used Uniform Manifold Approximation and Projection (UMAP), but it's not guaranteed that this method fits our data best, so I'd like to try other data reduction methods and compare the clustering results. 
+
+### Principal Component Analysis (PCA):
+
+&nbsp;&nbsp;&nbsp;&nbsp;PCA is a linear dimension reduction technique that aims to find the orthogonal directions (principal components) in the data that explain the maximum variance.
+
+However, PCA has some assumptions, which may not be met by our data. Some of the assumptions are: linearity, large variances have important structure, and data is centered and so on. 
+
+I made a cumulative proportion of variance explained plot to see how many components(features) I need to keep to explain a certain proportion (e.g., 95%) of the total variance.
+
+```{r echo=FALSE}
+# Suppose data is your data frame with 64 columns of features
+set.seed(123)
+# Perform PCA
+pca_result <- prcomp(data, scale. = TRUE)
+
+# Extract the proportion of variance explained by each principal component
+explained_variance <- pca_result$sdev^2
+total_variance <- sum(explained_variance)
+explained_variance_ratio <- explained_variance / total_variance
+
+par(mfrow = c(1, 2))
+# Cumulative variance plot
+cumulative_explained_variance <- cumsum(explained_variance_ratio)
+plot(cumulative_explained_variance, xlab = "Principal Component", 
+     ylab = "Cumulative Proportion of Variance Explained", 
+     type = "b",
+     main = "Fig. 9")
+
+scores <- pca_result$x[,1:2]
+# Now 'scores' contains the coordinates of your data in the first principal component
+# These scores are a one-dimensional representation of your data.
+plot(scores[,1],scores[,2],cex=0.05, xlab = "Dimension 1", 
+     ylab = "Dimension 2", main = "2-D data (PCA with default setting)")
+
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;From Fig. 9, we can see an uniform variance, since the straight line might suggest that our original variables have almost equal variance, meaning that no subset of these variables captures a significantly higher proportion of the total variance. In practical terms, this means that all original variables contribute nearly equally to the dataset's structure, and no principal component can significantly summarize the information by using the PCA method.
+
+Therefore, PCA may not be the best dimensional reduction method for our data, so we should also try other dimension reduction strategies, to avoid being "trapped" by PCA, since we already expect the result may not be trustful since the assumptions may not be reached Let's try another non-linear one: t-SNE
+
+### t-Distributed Stochastic Neighbor Embedding (t-SNE)
+
+&nbsp;&nbsp;&nbsp;&nbsp;t-SNE is a nonlinear dimension reduction technique that focuses on preserving the local structure of the data. It constructs a probability distribution over pairs of data points in the high-dimensional space and a similar distribution in the low-dimensional space. Here are two parameters that affects the dimension reduction result for t-SNE, which are perplexity and $\rho$ a smooth parameter that controls the distance between clusters. 
+
+Here I tried three different perplexity values and repeat the mean-shift algorithm, and finally select perplexity = 40. [^22]
+
+[^22]: The way to read these tables is the same as what we did before, and different colors represent different clusters.
+
+```{r echo=FALSE}
+set.seed(123)
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_b <- Rtsne(data, dims = 2, perplexity = 20)
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_c <- Rtsne(data, dims = 2)
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_d <- Rtsne(data, dims = 2, perplexity = 40)
+
+embedding_2D <- tsne_results_2D_d$Y
+
+# Run t-SNE for 1 dimension
+tsne_results_1D <- Rtsne(data, dims = 1, perplexity = 40)
+# The one-dimensional embedding is stored in 'Y'
+embedding_1D <- tsne_results_1D$Y
+
+# Define the range of kernel widths to test
+h_range_1 <- seq(2.5, 5, by = 0.5)
+
+dv_1 <- sample(embedding_1D,1200)
+
+d_1 <- setdiff(embedding_1D,dv_1)
+
+# Compute log-likelihood of validation set for each kernel width
+lv_1 <- rep(0, length(h_range_1))
+for (i in 1:length(h_range_1)) {
+  h <- h_range_1[i]
+  ph <- sapply(dv_1, function(x) kernel_density(x, d_1, h))
+  lv_1[i] <- sum(log(ph))
+}
+
+h <- h_range_1[which.max(lv_1)]
+
+x <- seq(-60, 60, length.out = 1000)
+
+plot1 <- sapply(x, function(x) kernel_density(x, embedding_1D, h))
+
+# Subset your data
+idx <- sample(1:12000, 100, replace = FALSE)  # indices of the points you applied mean shift to
+mean_shift_data <- embedding_1D[idx]  # the points you applied mean shift to
+remaining_data <- embedding_1D[-idx]  # the points that remain
+x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(embedding_1D, h, x))
+# KDE
+plot_prime <- sapply(x_prime_sub, function(x) kernel_density(x, embedding_1D, h))
+
+delta <- 2
+
+clusters <- find_clusters(x_prime_sub, delta)-1
+
+clusters_unsorted <- NULL
+
+for (i in 1:length(x_prime_sub)) {
+  clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+}
+# Use k-NN to assign remaining points to clusters
+remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                          test = matrix(remaining_data, ncol = 1), 
+                          cl = clusters_unsorted, 
+                          k = 3)
+
+# Combine cluster assignments
+all_clusters <- matrix(c(1:12000,rep(NA,12000)), nrow = 12000, ncol = 2)
+
+all_clusters[idx,2] <- clusters_unsorted
+all_clusters[-idx,2] <- as.numeric(remaining_clusters)-1
+```
+
+```{r echo=FALSE}
+# Let's say your data is stored in a data frame named 'data'
+par(mfrow = c(2, 2))
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_b$Y[,1],tsne_results_2D_b$Y[,2],cex=0.05, main = "perplexity=20",xlab = "dimension 1", ylab = "dimension 2")
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_c$Y[,1],tsne_results_2D_c$Y[,2],cex=0.05, main = "perplexity=30",xlab = "dimension 1", ylab = "dimension 2")
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_d$Y[,1],tsne_results_2D_d$Y[,2],cex=0.05, main = "perplexity=40",xlab = "dimension 1", ylab = "dimension 2")
+
+plot(embedding_2D[,1], embedding_2D[,2], col = all_clusters[,2]+1, cex=0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Clustering result(t-SNE)")
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;Finally, the ME distance between clustering using UMAP+mean-shift and t-SNE+mean-shift is 0.04808333.
+
+```{r echo=FALSE,eval=FALSE}
+# Apply the function to your matrix
+calc_misclassification_error(all_clusters[,2],as.matrix(result1))
+```
+
+## III.IV Density Peak (Adding new clusters)
+
+&nbsp;&nbsp;&nbsp;&nbsp;Finally, to evaluate the density peak clustering algorithm, I added 25 new small (both in diameter and in density) clusters to random places in 2-D and repeated the clustering, and calculated the average ME distance between these results and my original one without a new cluster. The clustering results plots are attached next page, and we see specifically iterations 17 and 24 give different clustering numbers.
+
+The result ME distance is 0.01430769. Therefore, we can see that the misclassification error is not large. We may have a feeling that our method/clustering is stable. 
+
+```{r echo=FALSE,message=FALSE,eval=FALSE}
+set.seed(123)
+
+# Load required library
+library(MASS)
+library(densityClust)
+
+# Function to generate points
+generate_points <- function(n, center, diameter) {
+  # Define the covariance matrix
+  # The variance is set as (diameter / 2)^2 to ensure points fall within the specified diameter
+  # Assuming the x and y variables are uncorrelated, the covariance is set to 0
+  covariance_matrix <- matrix(c((diameter/2)^2, 0, 0, (diameter/2)^2), nrow = 2)
+  
+  # Generate the points
+  points <- mvrnorm(n, mu = center, Sigma = covariance_matrix)
+  
+  return(points)
+}
+
+# Initialize a matrix to store the clustering results for each iteration
+cluster_results_dense <- matrix(NA, nrow = nrow(proj_2d)+n, ncol = 26)
+cluster_results_dense[,1] <- c(result2,rep(-1,n))
+
+# Example usage
+n <- 100  # number of points to generate
+diameter <- 0.4  # diameter
+
+# Open a PDF file to save the plots
+pdf("myplots.pdf", width = 10, height = 10)
+
+# Setup the plotting area
+par(mfrow = c(5, 5), mar = c(2, 2, 2, 2))
+
+for(i in 1:25){  # Changed to 25 for illustration
+  # Generate random center coordinates
+  center_x <- runif(1, min = -11, max = 7)
+  center_y <- runif(1, min = -8, max = 6.5)
+  
+  center <- c(center_x, center_y)
+  
+  # Generate points
+  points <- generate_points(n, center, diameter)
+  
+  # Combine the new points with the original data
+  data_with_new_cluster <- rbind(proj_2d, points)
+
+  # Perform your clustering analysis on the new data
+  step1_new <- densityClust(data_with_new_cluster, k = 111)
+  step2_new <- findClusters(step1_new, rho = 0.8, delta = 1.8)
+  
+  cluster_results_dense[,i+1] <- step2_new$cluster
+
+  
+  # Count the number of clusters
+  n_clusters <- length(unique(step2_new$clusters))
+
+  # Generate a vector of colors using rainbow()
+  my_colors <- rainbow(n_clusters)
+  
+  # Assign each cluster to a color
+  cluster_colors <- my_colors[step2_new$clusters]
+
+  # Plot the result
+  plot(data_with_new_cluster[,1], data_with_new_cluster[,2], col = cluster_colors, cex = 0.1, ylab = "", xlab = "", main = paste("Iter", i, n_clusters,"clusters"))
+  
+  # Print the number of clusters for this iteration
+  cat("Iteration", i, "- Number of clusters:", n_clusters, "\n")
+}
+
+# Close the PDF file
+dev.off()
+
+# Apply the function to your matrix
+df <- cluster_results_dense
+df <- df[, c(25, 1:17, 19:24, 26, 18)]
+dME_matrix <- calc_misclassification_matrix(df)
+sum(dME_matrix, na.rm = TRUE)/(26*25/2)
+```
+
+# IV. Discussion and Conslusion
+
+&nbsp;&nbsp;&nbsp;&nbsp;So far in this project, I tried three methods of clustering and explained my work in depth with two of them (mean-shift & density peak). At the time I was doing the clustering, I didn't know the data is about writing digits, but the results can be interpreted with this information. For example, my mean-shift method gives 8 clusters, which means I combined some clusters by mistake. From my understanding, I may combine 3s and 8s since these two numbers have features similar. My density peak method gives 12 clusters, which means some of the numbers are read differently, and one thing that might explain this would be the different written styles for numbers 7 and number 1. 
+
+One thing that I'd like to bring to your attention is how to decide if our ME distance is small enough (in other words, good or bad). Whether this is considered "good" or "bad" depends on the context:
+
+ - Domain: If your work is in a field where small errors can lead to serious consequences (like healthcare or finance), then even an error of 4.3% (This is the value I get previously) might not be acceptable. But in other fields, this might be a satisfactory error rate.
+ 
+ - Comparison to other models: If other models, or a naive/random classification, give a higher misclassification error on the same data, then my model is comparatively better. I randomly assigned 8 groups to each data, and comparing the result to what I got using mean-shift, the ME distance is 0.864, which is obviously larger than our ME distances (0.016,0.043, and 0.014).
+ 
+```{r}
+rdn <- c(1,2,3,4,5,6,7,8)
+rdn_cluster <- sample(rdn,12000,replace = TRUE)
+calc_misclassification_error(rdn_cluster,as.matrix(result1))
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp;Another thing that I'd like to emphasize is that, according to the ME distances, my two clustering results both seem stable, but this doesn't imply my result is correct. The stability of a clustering result refers to its robustness in the face of slight perturbations to the data, so it's possible for two stable clustering results to have different numbers of clusters if the data has a complex structure or if different assumptions or parameters are used in the clustering algorithms. [^23]
+
+[^23]: For example, in some cases, the data can reasonably be grouped into different numbers of clusters depending on the scale or level of detail we're interested in. For example, we could cluster the people in a city into neighborhoods or into individual households, and both would be valid, stable clusterings, but with different numbers of clusters.
+
+# V. Reference
+
+Alex Rodriguez, Alessandro Laio ,Clustering by fast search and find of density peaks.Science344,1492-1496(2014).DOI:10.1126/science.1242072
+
+P.N. Yianilos. Data structures and algorithms for nearest neighbor search in general metric spaces. In Proceedings of the ACM-SIAM Symposium on Discrete Algorithms, pages 311–321, 1993.
+
+Xiao, C., & Liu, M. (2010, September). Efficient Mean‐shift Clustering Using Gaussian KD‐Tree. In Computer Graphics Forum (Vol. 29, No. 7, pp. 2065-2073). Blackwell Publishing Ltd.
+
+https://distill.pub/2016/misread-tsne/
+
+https://cran.r-project.org/web/packages/meanShiftR/meanShiftR.pdf
+
+
+# VI. Appendix
+
+```{r echo=FALSE}
+plot(proj_2d[,1], proj_2d[,2], cex=0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Fig.1")
+```
+
+```{r echo=FALSE}
+# Assuming data is your data frame and it has columns x, y, and cluster
+plot(proj_2d[,1], proj_2d[,2], col = as.matrix(result1), cex=0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Fig. 5")
+```
+
+```{r echo=FALSE}
+plot(data_dense[,1], data_dense[,2], col = data_dense[,3], cex = 0.05, xlab = "dimension 1", ylab = "dimension 2", main = "Density Peak Fig.7")
+
+```

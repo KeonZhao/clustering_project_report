@@ -1,0 +1,536 @@
+---
+title: "Project_eval"
+author: "Anqi Zhao"
+date: "2023-05-29"
+output: pdf_document
+---
+
+# Function import
+
+```{r}
+# Import the data
+setwd("/Users/keon/Desktop/Stat 527A/project")
+library(readr)
+library(uwot)
+library(dbscan)
+library(ggplot2)
+library(plotly)
+library(Rtsne)
+library(class)
+library(meanShiftR)
+library(dplyr)
+project_data <- read_csv("project-data.csv", col_names = FALSE)
+data <- as.matrix(project_data)
+result1 <- read_csv("alg1_out.txt", col_names = FALSE)
+# We make sure the first group index starts from 1
+result1 <- result1+1
+result2 <- read_csv("alg2_out.txt", col_names = FALSE)
+result2 <- as.matrix(result2)
+data_umap_1d <- read_csv("umap_1d.txt", col_names = FALSE)
+data_umap_1d <- as.matrix(data_umap_1d)
+data_umap_2d <- read_table("umap_2d.txt", col_names = FALSE)
+data_umap_2d <- as.matrix(data_umap_2d)
+```
+
+Mean-shift functions: 
+
+```{r}
+# Define the Gaussian kernel density estimator
+kernel_density <- function(x, d, h) {
+  K <- dnorm((x-d)/h)  # Gaussian kernel
+  return(sum(K)/(length(d)*h))
+}
+# Define the kernel function
+K <- function(u) {
+  return(1/(sqrt(2*pi))*exp(-0.5*u^2))
+}
+
+mean_shift <- function(D, h, xi) {
+  tol <- 1e-3*h
+  T <- 10000
+  for (t in 1:T) {
+    # Compute the mean shift vector
+    m <- sum(K((D - xi)/h)*D)/sum(K((D - xi)/h))
+    # Check for convergence
+    if (max(abs(m - xi)) < tol) {
+      return(m)
+    }
+    # Update x
+    xi <- m
+  }
+  # If convergence is not achieved after T iterations, return NULL
+  return(NULL)
+  # else if convergence is not achieved after T iterations, return the last xi value
+  #return(xi)
+}
+# Define function to find clusters
+find_clusters <- function(points, delta) {
+  # Sort the points in ascending order
+  points <- sort(points)
+  
+  # Initialize vector of cluster assignments
+  cluster_assignments <- rep(0, length(points))
+  
+  # Initialize cluster counter
+  cluster_count <- 1
+  
+  # Initialize first cluster
+  curr_cluster <- 1
+  
+  # Loop over remaining points
+  for (i in 1:length(points)) {
+    if (points[i] - points[curr_cluster] <= delta) {
+      # Add point to current cluster
+      cluster_assignments[i] <- cluster_count
+    } else {
+      # Start new cluster
+      curr_cluster <- i
+      cluster_count <- cluster_count + 1
+      cluster_assignments[i] <- cluster_count
+    }
+  }
+  
+  return(cluster_assignments)
+}
+```
+
+Since my first algorithm is mean-shift, then suppose our dimension reduction did its work, let's repeat the mean-shift by resampling the data.
+
+```{r}
+# Initialize an empty matrix to store cluster assignments from each iteration
+all_clusters_matrix <- matrix(NA, nrow = 12000, ncol = 100)
+
+delta <- 0.5
+
+h <- 0.9
+
+# Repeat the procedure 10 times
+for (j in 1:100) {
+  # Resample your data
+  set.seed(j*123)  # for reproducibility
+  idx <- sample(1:12000, 100, replace = FALSE)  # indices of the points you applied mean shift to
+  mean_shift_data <- data_umap_1d[idx]  # the points you applied mean shift to
+  remaining_data <- data_umap_1d[-idx]  # the points that remain
+  x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(data_umap_1d, h, x))
+  
+  # Find clusters
+  clusters <- find_clusters(x_prime_sub, delta)-1
+  
+  clusters_unsorted <- NULL
+  for (i in 1:length(x_prime_sub)) {
+    clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+  }
+
+  # Use k-NN to assign remaining points to clusters
+  remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                            test = matrix(remaining_data, ncol = 1), 
+                            cl = clusters_unsorted, 
+                            k = 3)
+  
+  # Combine cluster assignments
+  all_clusters <- rep(-1,12000)
+  all_clusters[idx] <- clusters_unsorted
+  all_clusters[-idx] <- as.numeric(remaining_clusters)-1
+
+  # Store this iteration's cluster assignments in the matrix
+  all_clusters_matrix[,j] <- all_clusters
+}
+
+```
+
+Calculate the sum of misclassification errors between clustering pairs:
+
+(Result evaluation see report_elements)
+
+```{r}
+# Define function to calculate pairwise misclassification error distance
+calc_pairwise_dME <- function(cluster_matrix) {
+  # Get number of columns in the matrix
+  n_col <- ncol(cluster_matrix)
+  
+  # Initialize matrix to store dME values
+  dME_matrix <- matrix(NA, n_col, n_col)
+  
+  # Loop through each pair of columns
+  for (i in 1:(n_col-1)) {
+    for (j in (i+1):n_col) {
+      # Calculate dME for this pair of columns and store in matrix
+      dME_matrix[i, j] <- sum(cluster_matrix[,i] != cluster_matrix[,j])
+    }
+  }
+  
+  # Since dME is symmetric, fill in lower triangle of the matrix
+  dME_matrix[lower.tri(dME_matrix)] <- t(dME_matrix)[lower.tri(dME_matrix)]
+  
+  return(dME_matrix)
+}
+
+# Apply the function to your matrix
+dME_matrix <- calc_pairwise_dME(all_clusters_matrix)
+
+# Now, to find the sum of all pairwise distances,
+total_dME <- sum(dME_matrix, na.rm = TRUE)/2
+avg_dist <- total_dME/(100*99/2)
+avg_dist
+avg_dist/12000
+# 190.5826/12000
+```
+
+Density Peak - is it stable? 
+
+We can do bootstrap-NO
+
+```{r}
+# # Initialize a matrix to store the clustering results for each bootstrap iteration
+# bootstrap_clusters <- matrix(NA, nrow = nrow(data_umap_2d), ncol = 100)
+# 
+# # Set the seed here
+# set.seed(123)
+# 
+# # Repeat the clustering 100 times on bootstrap samples of your data
+# for (i in 1:100) {
+#   # Generate a bootstrap sample
+#   bootstrap_sample_indices <- sample(1:nrow(data_umap_2d), size = nrow(data_umap_2d), replace = TRUE)
+#   bootstrap_sample <- data_umap_2d[bootstrap_sample_indices, ]
+#   
+#   # Perform density peak clustering on the bootstrap sample
+#   step1_bootstrap <- densityClust(bootstrap_sample, k = 111)
+#   step2_bootstrap <- findClusters(step1_bootstrap, rho = 0.8, delta = 1.8)
+#   
+#   # Store the clustering result in the matrix
+#   bootstrap_clusters[,i] <- step2_bootstrap$cluster
+# }
+# 
+# # Calculate the pairwise dME for the clustering results
+# dME_matrix <- calc_pairwise_dME(bootstrap_clusters)
+# 
+# # Calculate the average dME
+# average_dME <- mean(dME_matrix, na.rm = TRUE)
+# 
+# # Print the average dME
+# print(average_dME)
+```
+
+Add new clusters:
+
+If: Far from the others? Whether the result will change depends on the diameter and density of the new cluster added. We ensure that both the size and the diameter of the new cluster to be strictly smaller than that of 
+
+```{r}
+# Load required library
+library(MASS)
+library(densityClust)
+
+
+set.seed(123)
+
+# Function to generate points
+generate_points <- function(n, center, diameter) {
+  # Define the covariance matrix
+  # The variance is set as (diameter / 2)^2 to ensure points fall within the specified diameter
+  # Assuming the x and y variables are uncorrelated, the covariance is set to 0
+  covariance_matrix <- matrix(c((diameter/2)^2, 0, 0, (diameter/2)^2), nrow = 2)
+  
+  # Generate the points
+  points <- mvrnorm(n, mu = center, Sigma = covariance_matrix)
+  
+  return(points)
+}
+
+# Example usage
+n <- 100  # number of points to generate
+center <- c(-5, -2)  # center point (x,y)
+diameter <- 0.4  # diameter
+
+points <- generate_points(n, center, diameter)
+
+data_with_new_cluster <- rbind(data_umap_2d, points)
+
+plot(data_with_new_cluster[,1],data_with_new_cluster[,2],cex = 0.1)
+
+# Perform your clustering analysis on the new data
+step1_new <- densityClust(data_with_new_cluster, k = 111)
+step2_new <- findClusters(step1_new, rho = 0.8, delta = 1.8)
+
+n_clusters <- length(unique(step2_new$clusters))
+# Generate a vector of colors using rainbow()
+my_colors <- rainbow(n_clusters)
+# Assign each cluster to a color
+cluster_colors <- my_colors[step2_new$clusters]
+
+plot(data_with_new_cluster[,1], data_with_new_cluster[,2], col = cluster_colors, cex = 0.1, ylab = "dimension 2", xlab = "dimension 1", main = "Clustering Result using density-peak UMAP-2D")
+```
+
+If: Randomly generating 25 more clusters (we can generate more, but we this time do 25 for illustration):
+
+```{r}
+set.seed(123)
+
+# Initialize a matrix to store the clustering results for each iteration
+cluster_results_dense <- matrix(NA, nrow = nrow(data_umap_2d)+n, ncol = 26)
+cluster_results_dense[,1] <- c(result2,rep(-1,n))
+
+# Open a PDF file to save the plots
+pdf("myplots.pdf", width = 10, height = 10)
+
+# Setup the plotting area
+par(mfrow = c(5, 5), mar = c(2, 2, 2, 2))
+
+for(i in 1:25){  # Changed to 25 for illustration
+  # Generate random center coordinates
+  center_x <- runif(1, min = -11, max = 7)
+  center_y <- runif(1, min = -8, max = 6.5)
+  
+  center <- c(center_x, center_y)
+  
+  # Generate points
+  points <- generate_points(n, center, diameter)
+  
+  # Combine the new points with the original data
+  data_with_new_cluster <- rbind(data_umap_2d, points)
+
+  # Perform your clustering analysis on the new data
+  step1_new <- densityClust(data_with_new_cluster, k = 111)
+  step2_new <- findClusters(step1_new, rho = 0.8, delta = 1.8)
+  
+  cluster_results_dense[,i+1] <- step2_new$cluster
+
+  
+  # Count the number of clusters
+  n_clusters <- length(unique(step2_new$clusters))
+
+  # Generate a vector of colors using rainbow()
+  my_colors <- rainbow(n_clusters)
+  
+  # Assign each cluster to a color
+  cluster_colors <- my_colors[step2_new$clusters]
+
+  # Plot the result
+  plot(data_with_new_cluster[,1], data_with_new_cluster[,2], col = cluster_colors, cex = 0.1, ylab = "", xlab = "", main = paste("Iter", i))
+  
+  # Print the number of clusters for this iteration
+  cat("Iteration", i, "- Number of clusters:", n_clusters, "\n")
+}
+
+# Close the PDF file
+dev.off()
+```
+
+Since we observe that for the 17th and 24th iteration, the number of clusters changes, which means the clusters' indices are also likely to change. We can do some simple modification to the data such that the indices can be matched. 
+
+```{r}
+# Replace "7" with "-8" in column 18
+data_mat <- cluster_results_dense
+
+# Using temporary placeholders
+data_mat[data_mat[, 18] == 6, 18] <- -100
+data_mat[data_mat[, 18] == 7, 18] <- -101
+data_mat[data_mat[, 18] == 8, 18] <- -102
+data_mat[data_mat[, 18] == 11, 18] <- -103
+data_mat[data_mat[, 18] == 12, 18] <- -104
+data_mat[data_mat[, 18] == 13, 18] <- -105
+
+# Now do the actual replacements
+data_mat[data_mat[, 18] == -100, 18] <- 7
+data_mat[data_mat[, 18] == -101, 18] <- 8
+data_mat[data_mat[, 18] == -102, 18] <- 6
+data_mat[data_mat[, 18] == -103, 18] <- 13
+data_mat[data_mat[, 18] == -104, 18] <- 11
+data_mat[data_mat[, 18] == -105, 18] <- 12
+
+# Same for column 25
+data_mat[data_mat[, 25] == 7, 25] <- -200
+data_mat[data_mat[, 25] == 8, 25] <- -201
+data_mat[data_mat[, 25] == 6, 25] <- -202
+
+data_mat[data_mat[, 25] == -200, 25] <- 8
+data_mat[data_mat[, 25] == -201, 25] <- 6
+data_mat[data_mat[, 25] == -202, 25] <- 7
+```
+
+```{r}
+# calc_pairwise_dME <- function(cluster_matrix) {
+#   # Get the dimensions of the matrix
+#   n_row <- nrow(cluster_matrix)
+#   n_col <- ncol(cluster_matrix)
+#   
+#   # Initialize a list to store the binary matrices
+#   binary_matrices <- vector("list", n_col)
+#   
+#   # Loop through each column to create the binary matrix for each clustering result
+#   for (i in 1:n_col) {
+#     binary_matrix <- matrix(0, n_row, n_row)
+#     for (j in 1:(n_row - 1)) {
+#       for (k in (j + 1):n_row) {
+#         binary_matrix[j, k] <- as.integer(cluster_matrix[j, i] == cluster_matrix[k, i])
+#       }
+#     }
+#     binary_matrices[[i]] <- binary_matrix + t(binary_matrix)
+#   }
+#   
+#   # Initialize matrix to store dME values
+#   dME_matrix <- matrix(NA, n_col, n_col)
+#   
+#   # Loop through each pair of columns
+#   for (i in 1:(n_col - 1)) {
+#     for (j in (i + 1):n_col) {
+#       # Calculate dME for this pair of columns and store in matrix
+#       dME_matrix[i, j] <- sum(binary_matrices[[i]] != binary_matrices[[j]])
+#     }
+#   }
+#   
+#   # Since dME is symmetric, fill in lower triangle of the matrix
+#   dME_matrix[lower.tri(dME_matrix)] <- t(dME_matrix)[lower.tri(dME_matrix)]
+#   
+#   return(dME_matrix)
+# }
+
+# dME_matrix_dense <- calc_pairwise_dME_dense(cluster_results_dense[1:12000,])
+
+# Error: vector memory exhausted (limit reached?)
+
+dME_matrix_dense <- calc_pairwise_dME(data_mat[1:12000,])
+
+# Now, to find the sum of all pairwise distances,
+total_dME_dense <- sum(dME_matrix_dense, na.rm = TRUE)/2
+avg_dist_dense <- total_dME_dense/(26*25/2)
+avg_dist_dense
+avg_dist_dense/12000
+```
+
+Therefore, we can see that the misclassification error is not large. We may have a feeling that our method/clustering is stable. 
+
+However, visually, it's not very optimal, since in 2-D view, it seems separates some compact cluster into two. 
+
+Recall the 2-D graph: 
+
+```{r}
+n_clusters <- length(unique(result2))
+# Generate a vector of colors using rainbow()
+my_colors <- rainbow(n_clusters)
+# Assign each cluster to a color
+cluster_colors <- my_colors[result2]
+
+# Plot
+plot(data_umap_2d[,1], data_umap_2d[,2], col = cluster_colors, cex = 0.1, ylab = "dimension 2", xlab = "dimension 1", main = "Clustering Result using density-peak UMAP-2D")
+
+```
+
+Again, stable in 2-D may not apply stable in 64-D, we recongnize that our dimension reduction method would influence our clustering result. 
+
+Now let's do a t-SNE dimension reduction for the mean-shift algorithm, let's see the clustering result comparing to the one we already have using UMAP. Does the result changes a lot?  
+
+We start with check what perpenxity looks the best.
+
+```{r}
+set.seed(123)
+
+# Let's say your data is stored in a data frame named 'data'
+par(mfrow = c(2, 2))
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_a <- Rtsne(data, dims = 2, perplexity = 10)
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_a$Y[,1],tsne_results_2D_a$Y[,2],cex=0.1, main = "perplexity=10",xlab = "dimension 1", ylab = "dimension 2")
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_b <- Rtsne(data, dims = 2, perplexity = 20)
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_b$Y[,1],tsne_results_2D_b$Y[,2],cex=0.1, main = "perplexity=20",xlab = "dimension 1", ylab = "dimension 2")
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_c <- Rtsne(data, dims = 2)
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_c$Y[,1],tsne_results_2D_c$Y[,2],cex=0.1, main = "perplexity=30",xlab = "dimension 1", ylab = "dimension 2")
+
+# Run t-SNE for 2 dimensions
+tsne_results_2D_d <- Rtsne(data, dims = 2, perplexity = 40)
+# The two-dimensional embedding is stored in 'Y'
+plot(tsne_results_2D_d$Y[,1],tsne_results_2D_d$Y[,2],cex=0.1, main = "perplexity=40",xlab = "dimension 1", ylab = "dimension 2")
+```
+
+```{r}
+embedding_2D <- tsne_results_2D_d$Y
+
+# Run t-SNE for 1 dimension
+tsne_results_1D <- Rtsne(data, dims = 1, perplexity = 40)
+# The one-dimensional embedding is stored in 'Y'
+embedding_1D <- tsne_results_1D$Y
+```
+
+```{r}
+set.seed(123)
+# Define the range of kernel widths to test
+h_range_1 <- seq(2.5, 5, by = 0.5)
+
+dv_1 <- sample(embedding_1D,1200)
+
+d_1 <- setdiff(embedding_1D,dv_1)
+
+# Compute log-likelihood of validation set for each kernel width
+lv_1 <- rep(0, length(h_range_1))
+for (i in 1:length(h_range_1)) {
+  h <- h_range_1[i]
+  ph <- sapply(dv_1, function(x) kernel_density(x, d_1, h))
+  lv_1[i] <- sum(log(ph))
+}
+
+h <- h_range_1[which.max(lv_1)]
+
+x <- seq(-60, 60, length.out = 1000)
+
+plot1 <- sapply(x, function(x) kernel_density(x, embedding_1D, h))
+
+# Subset your data
+idx <- sample(1:12000, 100, replace = FALSE)  # indices of the points you applied mean shift to
+mean_shift_data <- embedding_1D[idx]  # the points you applied mean shift to
+remaining_data <- embedding_1D[-idx]  # the points that remain
+x_prime_sub <- sapply(mean_shift_data, function(x) mean_shift(embedding_1D, h, x))
+# KDE
+plot_prime <- sapply(x_prime_sub, function(x) kernel_density(x, embedding_1D, h))
+
+delta <- 2
+
+clusters <- find_clusters(x_prime_sub, delta)-1
+
+clusters_unsorted <- NULL
+
+for (i in 1:length(x_prime_sub)) {
+  clusters_unsorted[i] <- clusters[rank(x_prime_sub)[i]]
+}
+# Use k-NN to assign remaining points to clusters
+remaining_clusters <- knn(train = matrix(mean_shift_data, ncol = 1), 
+                          test = matrix(remaining_data, ncol = 1), 
+                          cl = clusters_unsorted, 
+                          k = 3)
+
+# Combine cluster assignments
+all_clusters <- matrix(c(1:12000,rep(NA,12000)), nrow = 12000, ncol = 2)
+
+all_clusters[idx,2] <- clusters_unsorted
+all_clusters[-idx,2] <- as.numeric(remaining_clusters)-1
+
+plot(embedding_2D[,1], embedding_2D[,2], col = all_clusters[,2]+1, cex=0.1)
+
+```
+
+```{r}
+cluster_matrix <- cbind(result1,as.matrix(all_clusters[,2])+1)
+
+dME_matrix_tsne <- calc_pairwise_dME(cluster_matrix)
+
+# Now, to find the sum of all pairwise distances,
+total_dME_tsne <- sum(dME_matrix_tsne, na.rm = TRUE)/2
+avg_dist_tsne <- total_dME_tsne/(2*1/2)
+avg_dist_tsne
+avg_dist_tsne/12000
+```
+
+Therefore, from the output above, we know that different dimension reduction may affect the clustering result, but in general, in our case we see an around 6.9% of difference in clustering using t-SNE and UMAP. (We can also repeat the dimension reduction several times and redo the clustering to get a more accurate percentage since some simulations are involved, but note t-SNE is very computational expensive.)
+
+One thing we could imply from our finding is: by doing dimension reduction, some features are lost, which causes mis-classification. For example, in my case, I applied my mean-shift function to 1-D data, then coloring 2-D data by the clustering result. We can see that close to be bounders, there are some different colors shown (especially the green points within blue area), and this is expected as the dimension reduction causes some points to be recongnized as part of another "group". Thus, we may imply that although our clustering result looks reasonable in general in lower dimensions, it's less likely to be this good comparing to the true clustering in higher dimensions. 
+
+What improvement can we have? 
+
+
+
+
